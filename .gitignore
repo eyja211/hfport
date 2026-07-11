@@ -1,0 +1,36 @@
+# Generated ports and reverse-engineering workspaces
+/output/
+/work/
+/hfe-modding/
+
+# Locally supplied games, Flash content, and third-party tools
+*.exe
+*.swf
+*.jar
+/FFDec/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local configuration and logs
+.env
+.env.*
+*.log

@@ -1,0 +1,11 @@
+{
+  "src_exe": "C:\\path\\to\\source-build.exe",
+  "dst_exe": "C:\\path\\to\\target-build.exe",
+  "out_exe": "C:\\path\\to\\output\\target-build+ported.exe",
+  "chars": [
+    "character_id"
+  ],
+  "display_suffix": " (port)",
+  "ffdec": "C:\\path\\to\\ffdec.jar",
+  "work_dir": "C:\\path\\to\\hfport-work"
+}
