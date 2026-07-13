@@ -188,7 +188,8 @@ def parse_doabc(body):
 
 def read_projector(path):
     """EXE -> (exe_prefix_bytes, swf_bytes)。也接受纯 SWF 文件。"""
-    data = open(path, 'rb').read()
+    with open(path, 'rb') as f:
+        data = f.read()
     if data[:3] in (b'FWS', b'CWS'):
         return b'', data
     if data[:2] != b'MZ':

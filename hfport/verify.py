@@ -76,6 +76,54 @@ def verify(out_exe, report=None, log=print):
     n_groups = len(groups)
     slots = G.arr_items(mv.item.props.get('spriteLimb'))
 
+    if report:
+        manifest = report.get('manifest', {})
+        target_counts = manifest.get('target_item_counts', {})
+        prefix_hashes = manifest.get('item_prefix_hashes', {})
+        seqs = {
+            'groups': groups,
+            'actions': G.arr_items(mv.item.props.get('action')),
+            'frames': G.arr_items(mv.item.props.get('frame')),
+            'slots': slots,
+        }
+        for key, count in target_counts.items():
+            count = int(count)
+            got = G.md5(b'|'.join(G.norm_obj_bytes(x) for x in seqs[key][:count]))
+            if got != prefix_hashes.get(key):
+                errs.append('目标原 item %s 前缀被修改' % key)
+        mapped_groups = []
+        for src_i, dst_i in manifest.get('item_group_map', {}).items():
+            dst_i = int(dst_i)
+            mapped_groups.append(dst_i)
+            if dst_i < int(target_counts.get('groups', 0)) or dst_i >= n_groups:
+                errs.append('移植 item 组 %s 映射到非法下标 %d' % (src_i, dst_i))
+        if len(mapped_groups) != len(set(mapped_groups)):
+            errs.append('多个源 item 组映射到同一目标下标')
+        for src_i, dst_i in manifest.get('invalid_group_map', {}).items():
+            if int(dst_i) < n_groups:
+                errs.append('源悬空 item 组 %s 意外解析到目标下标 %s' % (src_i, dst_i))
+        for src_name, mapped in manifest.get('item_limb_map', {}).items():
+            if mapped not in mv.limbs:
+                errs.append('移植 item 肢体缺失: %s -> %s' % (src_name, mapped))
+        runtime_pngs = {}
+        runtime_lmis = []
+        if 'lmi_data/item.lmi' in mv.lmis:
+            runtime_lmis.append(mv.lmis['lmi_data/item.lmi'])
+        for kind, cls, path in manifest.get('load_sequence', []):
+            if kind == 'lmi' and path in mv.lmis:
+                runtime_lmis.append(mv.lmis[path])
+        for lmi in runtime_lmis:
+            for idx, pic in enumerate(lmi.limb_pics):
+                filename = pic.props.get('filename')
+                if filename and lmi.pngs[idx] is not None:
+                    runtime_pngs[filename] = lmi.pngs[idx]
+        for mapped, expected_hash in manifest.get('copied_png_hashes', {}).items():
+            got = runtime_pngs.get(mapped)
+            if got is None:
+                errs.append('移植 PNG 缺失: %s' % mapped)
+            elif G.md5(got) != expected_hash:
+                errs.append('移植 PNG 内容不来自源版本: %s' % mapped)
+
     # itemSpt 内部索引完整性
     actions = G.arr_items(mv.item.props.get('action'))
     frames = G.arr_items(mv.item.props.get('frame'))
@@ -141,6 +189,39 @@ def verify(out_exe, report=None, log=print):
         for nid in ids:
             if nid not in strings:
                 errs.append('注册字符串缺失: %s' % nid)
+        page_info = report.get('charlist_pages', {})
+        expected_pages = page_info.get('after')
+        if expected_pages is not None:
+            mi, _ = main_abc.find_class_method(
+                'Page', 'CharList', 'NextPage', static=False
+            )
+            page_body = main_abc.body_of_method(mi)
+            insns = list(A.walk_code(page_body.code))
+            limits = []
+            for idx in range(len(insns) - 3):
+                a, b, c, d = insns[idx:idx + 4]
+                if (a[1] in (0xD0, 0x62) and b[1] == 0x66
+                        and c[1] == 0x24 and 0x0C <= d[1] <= 0x1A):
+                    limits.append(c[2][0])
+            if limits != [int(expected_pages)]:
+                errs.append(
+                    '角色一览翻页上限错误: %r != %d'
+                    % (limits, int(expected_pages))
+                )
+            mi, _ = main_abc.find_class_method(
+                'Page', 'CharList', 'OnEnterFrame', static=False
+            )
+            denom_body = main_abc.body_of_method(mi)
+            denominators = []
+            for _, op, ops, _ in A.walk_code(denom_body.code):
+                if op == 0x2C:
+                    value = main_abc.strings[ops[0]]
+                    if value.startswith('/') and value[1:].isdigit():
+                        denominators.append(value)
+            if denominators != ['/%d' % int(expected_pages)]:
+                errs.append(
+                    '角色一览页码分母错误: %r' % denominators
+                )
         for kind, cls, path in report['manifest']['load_sequence']:
             if path not in strings:
                 errs.append('加载路径缺失: %s' % path)
@@ -153,7 +234,8 @@ def verify(out_exe, report=None, log=print):
         asset_ok = set()
         for i, t in f.find_tags(S.TAG_DOABC):
             _, name, abc_bytes = S.parse_doabc(t.body)
-            if name == 'hfport_assets':
+            if name == (report or {}).get('asset_abc_name') or (
+                    isinstance(name, str) and name.startswith('hfport_assets_')):
                 aabc = A.AbcFile.parse(abc_bytes)
                 for inst in aabc.instances:
                     mn = aabc.multinames[inst['name']]
@@ -164,6 +246,27 @@ def verify(out_exe, report=None, log=print):
         for cls in report.get('new_class_ids', {}):
             if cls not in sym.values():
                 errs.append('SymbolClass 缺少绑定: %s' % cls)
+
+        new_ids = report.get('manifest', {}).get('new_ids', {})
+        deps = report.get('manifest', {}).get('spt_dependencies', {})
+        port_ids = set(report.get('manifest', {}).get('port_ids', []))
+        for src_id in port_ids:
+            new_id = new_ids.get(src_id)
+            if not new_id:
+                errs.append('SPT 依赖缺少新 ID: %s' % src_id)
+                continue
+            try:
+                spt = mv.spt(new_id)
+            except Exception as ex:
+                errs.append('新 SPT 无法读取 %s: %s' % (new_id, ex))
+                continue
+            src_ref = deps.get(src_id)
+            expected_ref = new_ids.get(src_ref, src_ref)
+            if spt.props.get('refSpt') != expected_ref:
+                errs.append(
+                    'refSpt 重写错误 %s: %r != %r'
+                    % (new_id, spt.props.get('refSpt'), expected_ref)
+                )
 
     # 7. fSpec 兼容性（信息性）
     if report:

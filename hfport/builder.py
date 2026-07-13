@@ -19,7 +19,7 @@ from . import swf as S
 
 class Builder:
     def __init__(self, src_exe, dst_exe, out_exe, chars, work_dir,
-                 ffdec_jar=None, display_suffix=' (PM)', log=print):
+                 ffdec_jar=None, display_suffix=None, namespace=None, log=print):
         self.src_exe = src_exe
         self.dst_exe = dst_exe
         self.out_exe = out_exe
@@ -27,12 +27,22 @@ class Builder:
         self.work = work_dir
         self.ffdec = ffdec_jar
         self.display_suffix = display_suffix
+        self.requested_namespace = namespace
         self.log = log
 
     # ------------------------------------------------------------ 主流程
 
     def run(self):
         log = self.log
+        src_abs = os.path.normcase(os.path.abspath(self.src_exe))
+        dst_abs = os.path.normcase(os.path.abspath(self.dst_exe))
+        out_abs = os.path.normcase(os.path.abspath(self.out_exe))
+        if out_abs in (src_abs, dst_abs):
+            raise RuntimeError('输出 EXE 不能覆盖源版本或目标版本')
+        if not self.chars:
+            raise RuntimeError('至少选择一个角色')
+        if len(set(self.chars)) != len(self.chars):
+            raise RuntimeError('角色选择中存在重复 ID')
         log('[1/8] 读取两个版本...')
         self.dst_prefix, dst_swf = S.read_projector(self.dst_exe)
         _, src_swf = S.read_projector(self.src_exe)
@@ -43,19 +53,18 @@ class Builder:
         self.dst.load_all_lmis()
         log('   源肢体 %d，目标肢体 %d' % (len(self.src.limbs), len(self.dst.limbs)))
 
-        log('[2/8] 计算依赖闭包与冲突决策...')
-        plan = P.Plan(self.chars, display_suffix=self.display_suffix)
-        self.plan = plan
-        porter = P.Porter(self.src, self.dst, plan, log=log)
+        log('[2/8] 提取版本清单与预检...')
+        self._extract_registry()
+
+        log('[3/8] 计算依赖闭包与冲突决策...')
+        porter = P.Porter(self.src, self.dst, self.plan, log=log)
         porter.analyze()
-        log('[3/8] 数据变换与合并...')
+        log('[4/8] 数据变换与合并...')
         porter.transform()
         self.new_p, self.rep_p, self.manifest = porter.payloads()
         self.porter = porter
         log('   新增载荷 %d 个，替换载荷 %d 个' % (len(self.new_p), len(self.rep_p)))
-
-        log('[4/8] 提取注册数据（pow/langWords/绑定/charOption）...')
-        self._extract_registry()
+        self.manifest['char_meta'] = self.char_meta
 
         log('[5/8] 生成注册代码补丁...')
         self._patch_abc()
@@ -76,6 +85,11 @@ class Builder:
             'chars': self.char_meta,
             'new_class_ids': self.new_class_ids,
             'out_exe': self.out_exe,
+            'namespace': self.plan.namespace,
+            'src_hash': self.src_hash,
+            'dst_hash': self.dst_hash,
+            'asset_abc_name': self.asset_abc_name,
+            'charlist_pages': self.charlist_page_info,
         }
         rp = os.path.join(self.work, 'build_report.json')
         json.dump(report, open(rp, 'w', encoding='utf-8'), ensure_ascii=False, indent=1, default=str)
@@ -85,39 +99,86 @@ class Builder:
     # ------------------------------------------------------------ 注册数据
 
     def _extract_registry(self):
-        srcdir = os.path.join(self.work, 'reg_src')
-        dstdir = os.path.join(self.work, 'reg_dst')
-        classes = ('Data.Global', 'Web_misc.SelectCharPanel')
-        sp = R.ensure_exports(self.work, self.ffdec, self.src_exe, srcdir, classes)
-        dp = R.ensure_exports(self.work, self.ffdec, self.dst_exe, dstdir, classes)
-        stext = open(sp['Data.Global'], encoding='utf-8').read()
-        dtext = open(dp['Data.Global'], encoding='utf-8').read()
-        s_pow = R.extract_pow(stext)
-        d_pow = R.extract_pow(dtext)
-        s_bind = R.extract_bindings(stext)
-        d_bind = R.extract_bindings(dtext)
-        bind_map = R.binding_target_map(s_bind, d_bind)
-        s_lw = R.extract_langwords(stext)
-        d_co = R.extract_charoption(open(dp['Web_misc.SelectCharPanel'], encoding='utf-8').read())
-        self.base_charlist = R.extract_charlistorder(dtext)
+        self.src_hash = R.export_cache_key(self.src_exe)
+        self.dst_hash = R.export_cache_key(self.dst_exe)
+        self.src_inventory = R.load_inventory(self.work, self.ffdec, self.src_exe)
+        self.dst_inventory = R.load_inventory(self.work, self.ffdec, self.dst_exe)
+        sinv = self.src_inventory
+        dinv = self.dst_inventory
+        self.src.sfx_class_by_index = dict(sinv.sound_classes)
+        self.dst.sfx_class_by_index = dict(dinv.sound_classes)
+
+        src_classes = set(self.src.swf.class_to_char_id())
+        missing = []
+        for slot in self.chars:
+            if slot not in sinv.pow:
+                missing.append('pow["%s"]' % slot)
+            if slot not in sinv.binding_codes:
+                missing.append('经验绑定 "%s"' % slot)
+            if 'Data.Global_%sSpt' % slot not in src_classes:
+                missing.append('Data.Global_%sSpt' % slot)
+        if missing:
+            raise RuntimeError('源版本预检失败，缺少: ' + '、'.join(missing))
+
+        source_spt_ids = [
+            cls[len('Data.Global_'):-3]
+            for cls in src_classes
+            if cls.startswith('Data.Global_') and cls.endswith('Spt')
+        ]
+        occupied_ids = set(dinv.pow)
+        occupied_ids.update(cid for _, _, cid in dinv.char_options)
+        occupied_names = set(self.dst.limbs)
+        occupied_names.update(self.dst.pngs)
+        occupied_names.update(self.dst.attack_by_name)
+        occupied_names.update(self.dst.pt_by_name)
+        for group in G.arr_items(self.dst.item.props.get('actionGroup')):
+            if isinstance(group, M.AmfObj) and isinstance(group.props.get('name'), str):
+                occupied_names.add(group.props['name'])
+        base_ns = self.requested_namespace or P.derive_namespace(self.src_exe)
+        namespace = P.allocate_namespace(
+            base_ns,
+            selected_ids=source_spt_ids,
+            occupied_ids=occupied_ids,
+            occupied_classes=set(self.dst.swf.class_to_char_id()),
+            occupied_names=occupied_names,
+        )
+        if self.display_suffix is None:
+            self.display_suffix = ' (%s)' % namespace.upper()
+        self.plan = P.Plan(
+            self.chars,
+            namespace=namespace,
+            display_suffix=self.display_suffix,
+        )
+        self.log('   命名空间: %s' % namespace)
+
+        bind_map = {}
+        for slot in self.chars:
+            code = sinv.binding_codes[slot]
+            target = R.choose_binding_target(slot, code, dinv.binding_codes)
+            if target is None:
+                raise RuntimeError(
+                    '目标版本没有可承接源角色 "%s" 的合法经验绑定' % slot
+                )
+            bind_map[slot] = target
+
+        self.base_charlist = list(dinv.char_list_order)
 
         max_i = 0
-        for slot, pairs in d_pow.items():
+        for slot, pairs in dinv.pow.items():
             d = dict(pairs)
             if isinstance(d.get('i'), float):
                 max_i = max(max_i, int(d['i']))
-        next_value = max(v for v, _, _ in d_co) + 1
+        values = [v for v, _, _ in dinv.char_options if v >= 0]
+        next_value = (max(values) + 1) if values else 0
 
         self.char_meta = []
         for k, slot in enumerate(self.chars):
             new_id = self.plan.new_id(slot)
-            pow_pairs = [list(x) for x in s_pow.get(slot, [])]
-            if not pow_pairs:
-                raise RuntimeError('源 pow["%s"] 未找到' % slot)
+            pow_pairs = [list(x) for x in sinv.pow[slot]]
             for pair in pow_pairs:
                 if pair[0] == 'i':
                     pair[1] = float(max_i + 1 + k)
-            lw = s_lw.get(slot) or [('en', slot), ('b5', slot)]
+            lw = sinv.langwords.get(slot) or [('en', slot), ('b5', slot)]
             lw2 = [(lang, txt + self.display_suffix) for lang, txt in lw]
             disp_en = dict(lw).get('en', slot) + self.display_suffix
             self.char_meta.append({
@@ -128,7 +189,6 @@ class Builder:
                 'value': next_value + k,
                 'display': disp_en,
             })
-        self.manifest['char_meta'] = self.char_meta
 
     # ------------------------------------------------------------ ABC 补丁
 
@@ -295,38 +355,87 @@ class Builder:
         base_ids = self.base_charlist  # 目标原有一览人数（不含随机等）
         total = len(base_ids) + len(self.char_meta)
         pages = max(1, math.ceil(total / self.CHARLIST_PER_PAGE))
-        old_pages = max(1, math.ceil(len(base_ids) / self.CHARLIST_PER_PAGE))
-        if pages <= old_pages:
-            self.log('   E 翻页: 人数 %d，仍 %d 页，无需扩容' % (total, pages))
+        mi, _ = abc.find_class_method('Page', 'CharList', 'NextPage', static=False)
+        next_body = abc.body_of_method(mi)
+        old_pages = self._read_next_page_limit(abc, next_body)
+        mi2, _ = abc.find_class_method('Page', 'CharList', 'OnEnterFrame', static=False)
+        body2 = abc.body_of_method(mi2)
+        denom_idx, denom_pages = self._read_page_denominator(abc, body2)
+        current_pages = max(old_pages, denom_pages)
+        pages = max(pages, current_pages)
+        if pages <= current_pages:
+            self.charlist_page_info = {
+                'before': current_pages, 'after': current_pages, 'total': total
+            }
+            self.log('   E 翻页: 人数 %d，当前 %d 页，无需扩容' % (total, current_pages))
             return
         if pages > 127:
             self.warnings_e = '一览页数 %d 超过 127，未扩容' % pages
+            self.charlist_page_info = {
+                'before': current_pages, 'after': current_pages, 'total': total
+            }
             self.log('   E 翻页: ⚠ ' + self.warnings_e)
             return
 
-        # E1: NextPage 的 `pushbyte <old_pages>`（翻页上限）-> pushbyte pages
-        mi, _ = abc.find_class_method('Page', 'CharList', 'NextPage', static=False)
-        b = abc.body_of_method(mi)
-        hit = A.patch_pushbyte_operand(b, old_pages, pages)
+        # E1: NextPage 中与 pageNum 属性相邻的页数操作数。
+        hit = self._patch_next_page_limit(abc, next_body, pages)
         if hit != 1:
-            raise RuntimeError('NextPage 翻页上限 pushbyte %d 命中 %d 次（预期1）' % (old_pages, hit))
+            raise RuntimeError('NextPage 语义页数操作数命中 %d 次（预期1）' % hit)
 
-        # E2: 页码分母 "/<old_pages>" -> 新建 "/<pages>" 字符串并重指该唯一 pushstring
-        old_denom = '/%d' % old_pages
-        try:
-            sidx = abc.strings.index(old_denom, 1)
-        except ValueError:
-            raise RuntimeError('页码分母字符串 %r 未找到' % old_denom)
+        # E2: 页码分母当前字符串 -> 新建 "/<pages>" 并重指。
+        sidx = denom_idx
         uses = A.string_usage_count(abc, sidx)
-        mi2, _ = abc.find_class_method('Page', 'CharList', 'OnEnterFrame', static=False)
-        b2 = abc.body_of_method(mi2)
         new_sidx = abc.str_idx('/%d' % pages)
-        patched = self._repoint_pushstring(b2, sidx, new_sidx)
+        patched = self._repoint_pushstring(body2, sidx, new_sidx)
         if patched != 1:
             raise RuntimeError('OnEnterFrame 分母 pushstring 命中 %d 次（预期1）' % patched)
         if uses != 1:
-            self.log('   E 翻页: 注意 "%s" 全局被引用 %d 次，仅改一览分母（新建字符串，未动原串）' % (old_denom, uses))
-        self.log('   E 翻页: 人数 %d -> %d 页（原 %d 页）' % (total, pages, old_pages))
+            self.log('   E 翻页: 注意当前分母全局被引用 %d 次，仅改一览分母' % uses)
+        self.charlist_page_info = {
+            'before': current_pages, 'after': pages, 'total': total
+        }
+        self.log('   E 翻页: 人数 %d -> %d 页（原 %d 页）' % (total, pages, current_pages))
+
+    @staticmethod
+    def _read_next_page_limit(abc, body):
+        limits = []
+        insns = list(A.walk_code(body.code))
+        for i in range(len(insns) - 3):
+            a, b, c, d = insns[i:i + 4]
+            if (a[1] in (0xD0, 0x62) and b[1] == 0x66 and c[1] == 0x24
+                    and 0x0C <= d[1] <= 0x1A):
+                limits.append(c[2][0])
+        if len(limits) != 1:
+            raise RuntimeError('NextPage 当前页数语义模式命中 %d 次' % len(limits))
+        return limits[0]
+
+    @staticmethod
+    def _patch_next_page_limit(abc, body, new_pages):
+        insns = list(A.walk_code(body.code))
+        hits = []
+        for i in range(len(insns) - 3):
+            a, b, c, d = insns[i:i + 4]
+            if (a[1] in (0xD0, 0x62) and b[1] == 0x66
+                    and c[1] == 0x24 and 0x0C <= d[1] <= 0x1A):
+                hits.append(c[0] + 1)
+        if len(hits) != 1:
+            return len(hits)
+        code = bytearray(body.code)
+        code[hits[0]] = new_pages
+        body.code = bytes(code)
+        return 1
+
+    @staticmethod
+    def _read_page_denominator(abc, body):
+        hits = []
+        for off, op, ops, nxt in A.walk_code(body.code):
+            if op == 0x2C:
+                value = abc.strings[ops[0]]
+                if isinstance(value, str) and value.startswith('/') and value[1:].isdigit():
+                    hits.append((ops[0], int(value[1:])))
+        if len(hits) != 1:
+            raise RuntimeError('OnEnterFrame 页码分母字符串命中 %d 次' % len(hits))
+        return hits[0]
 
     @staticmethod
     def _repoint_pushstring(body, old_sidx, new_sidx):
@@ -407,7 +516,9 @@ class Builder:
         scs = swf.symbol_classes()
         main_sc_idx, _ = max(scs, key=lambda x: len(x[1]))
         nid = swf.max_char_id() + 1
-        new_tags = [S.make_doabc_tag(self.asset_abc, 'hfport_assets')]
+        asset_abc_name = 'hfport_assets_%s' % self.plan.namespace
+        new_tags = [S.make_doabc_tag(self.asset_abc, asset_abc_name)]
+        self.asset_abc_name = asset_abc_name
         entries = []
         self.new_class_ids = {}
         for cls in sorted(self.new_p):

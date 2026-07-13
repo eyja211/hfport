@@ -14,14 +14,16 @@ overwriting either input file.
 
 - Character SPT data and LMI textures
 - Referenced attacks and Pt templates from `globalDat`
-- Item action groups, projectile data, and item textures
+- Isolated copies of referenced item action groups, projectiles, and textures
 - Referenced sound assets when the target does not already contain them
 - Character-list and VS-selection registration
 - Experience binding to an existing target character
 
-When source and target data use the same name for different content, hfport
-renames the imported dependency and rewrites the references that point to it.
-This prevents accidental collisions with data already present in the target.
+Every run gets a short source-derived namespace. If that namespace is already
+present in the target, hfport automatically allocates the next numbered variant.
+Item groups are always copied to new indices even when source and target use the
+same original `int1`; a ported character therefore cannot silently use the
+target mod's edited version of that item.
 
 ## Compatibility
 
@@ -65,7 +67,8 @@ the common local layout.
    python -m hfport.cli
    ```
 
-5. Choose the source build, target build, and characters to import.
+5. Choose the source build, target build, and characters to import. A build that
+   was already extended by hfport can be used as either source or target.
 6. Review the static validation output, then test the generated EXE in-game.
 
 The tool writes a distinct output file under `output/` by default. It does not
@@ -102,6 +105,9 @@ sanity check is available everywhere:
 python -m compileall hfport
 python -m hfport.cli --help
 ```
+
+Registry exports are cached by the exact SHA-256 of each input EXE. Switching
+between mods cannot reuse another build's stale `pow`, binding, or selection data.
 
 ## Repository Layout
 

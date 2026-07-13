@@ -6,6 +6,7 @@
     "character_id"
   ],
   "display_suffix": " (port)",
+  "namespace": null,
   "ffdec": "C:\\path\\to\\ffdec.jar",
   "work_dir": "C:\\path\\to\\hfport-work"
 }

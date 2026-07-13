@@ -15,6 +15,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 from . import registry as R
 from . import swf as S
+from . import porter as P
 from .builder import Builder
 from . import verify as V
 
@@ -32,15 +33,16 @@ def find_ffdec():
 
 def list_selectable(exe, ffdec, work):
     """返回源可选角色 [(id, display_en)]，从 SelectCharPanel.charOption 读取（排除 random）。"""
-    d = os.path.join(work, 'reg_list_%s' % _stem(exe))
-    paths = R.ensure_exports(work, ffdec, exe, d, classes=('Web_misc.SelectCharPanel', 'Data.Global'))
-    co = R.extract_charoption(open(paths['Web_misc.SelectCharPanel'], encoding='utf-8').read())
-    lw = R.extract_langwords(open(paths['Data.Global'], encoding='utf-8').read())
+    inv = R.load_inventory(work, ffdec, exe)
     out = []
-    for value, name, cid in co:
+    seen = set()
+    for value, name, cid in inv.char_options:
         if cid == 'random':
             continue
-        disp = dict(lw.get(cid, [])).get('en', name)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        disp = dict(inv.langwords.get(cid, [])).get('en', name)
         out.append((cid, disp))
     return out
 
@@ -81,7 +83,8 @@ def run_config(cfg, log=print):
     b = Builder(
         src_exe=cfg['src_exe'], dst_exe=cfg['dst_exe'], out_exe=cfg['out_exe'],
         chars=cfg['chars'], work_dir=work, ffdec_jar=ffdec,
-        display_suffix=cfg.get('display_suffix', ' (PM)'), log=log)
+        display_suffix=cfg.get('display_suffix'),
+        namespace=cfg.get('namespace'), log=log)
     report = b.run()
     log('\n== 静态验证 ==')
     errs, warns = V.verify(cfg['out_exe'], report, log=log)
@@ -97,7 +100,7 @@ def _print_checklist(report, log):
     ids = [m['new_id'] for m in report['chars']]
     log('  1) 启动不卡死（加载末尾会有数秒读条属正常）')
     log('  2) “角色一览”出现新角色: ' + '、'.join(ids[:6]) + (' 等' if len(ids) > 6 else ''))
-    log('  3) VS 选人界面可选到带 (PM) 后缀的新角色并进战斗')
+    log('  3) VS 选人界面可选到带本次显示后缀的新角色并进战斗')
     log('  4) 抽查技能/飞行道具/贴图/音效表现与原版一致')
     log('  5) 原目标版本角色不受影响')
     log('  6) 登录后新角色等级 = 绑定角色等级（防封号）')
@@ -126,8 +129,9 @@ def wizard():
         chars = [roster[i - 1][0] for i in idxs if 1 <= i <= len(roster)]
     if not chars:
         print('未选择角色。'); return 1
-    suffix = ask('显示名后缀 [默认 " (PM)"]: ', ' (PM)')
-    default_out = os.path.join(ROOT, 'output', '%s +PM%d.exe' % (_stem(dst), len(chars)))
+    default_suffix = ' (%s)' % P.derive_namespace(src).upper()
+    suffix = ask('显示名后缀 [默认 "%s"]: ' % default_suffix, default_suffix)
+    default_out = os.path.join(ROOT, 'output', '%s +port%d.exe' % (_stem(dst), len(chars)))
     out = ask('输出 EXE 路径 [默认 %s]: ' % default_out, default_out)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     cfg = {'src_exe': src, 'dst_exe': dst, 'out_exe': out, 'chars': chars,

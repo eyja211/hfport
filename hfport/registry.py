@@ -1,14 +1,39 @@
 # -*- coding: utf-8 -*-
-"""从 FFDec 反编译文本提取注册数据：pow 字面量、langWords、经验绑定表、charOption。
+"""从 FFDec 反编译文本提取版本注册清单。
 
 工具运行时会自动调用 FFDec CLI 导出所需类的 .as 文本（有缓存则跳过）。
 """
-import os, re, subprocess
+import hashlib
+import os
+import re
+import subprocess
+from dataclasses import dataclass
 
 # 常见 Hero Fighter 兼容布局中 c1..c19 对应的角色登录字段序
 CANON_C = ['lucas', 'drew', 'shawn', 'jenny', 'taylor', 'leo', 'legge',
            'eason', 'yaga', 'jason', 'gordon', 'giggs', 'titto', 'sinan',
            'iczzy', 'heater', 'raye', 'vivian', 'livermore']
+
+
+@dataclass
+class VersionInventory:
+    pow: dict
+    langwords: dict
+    char_options: list
+    char_list_order: list
+    binding_codes: dict
+    sound_classes: dict
+
+
+def export_cache_key(exe_path):
+    h = hashlib.sha256()
+    with open(exe_path, 'rb') as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def ensure_exports(base_dir, ffdec_jar, exe_path, out_dir, classes=('Data.Global', 'Web_misc.SelectCharPanel')):
@@ -89,6 +114,45 @@ def extract_bindings(text):
     return out
 
 
+def extract_binding_links(text):
+    """追加块 pow["slot"].c = pow["other"].c; -> {slot: other}。"""
+    out = {}
+    pat = r'pow\["([\w#]+)"\]\.c\s*=\s*pow\["([\w#]+)"\]\.c\s*;'
+    for m in re.finditer(pat, text):
+        out[m.group(1)] = m.group(2)
+    return out
+
+
+def resolve_binding_codes(direct, links):
+    """把角色间绑定链解析为最终 cN；循环或断链不写入结果。"""
+    out = dict(direct)
+    for slot in links:
+        seen = set()
+        cur = slot
+        while cur not in out and cur in links and cur not in seen:
+            seen.add(cur)
+            cur = links[cur]
+        if cur in out:
+            out[slot] = out[cur]
+    return out
+
+
+def choose_binding_target(source_slot, source_code, target_codes):
+    holders = sorted(
+        slot for slot, code in target_codes.items() if code == source_code
+    )
+    canon = CANON_C[source_code - 1] if 1 <= source_code <= len(CANON_C) else None
+    if canon in holders:
+        return canon
+    if holders:
+        return holders[0]
+    if source_slot in target_codes:
+        return source_slot
+    if canon in target_codes:
+        return canon
+    return None
+
+
 def extract_charoption(text):
     """SelectCharPanel.as -> [(value:int, name:str, id:str)]"""
     m = re.search(r'charOption:Array\s*=\s*\[(.*?)\];', text, re.S)
@@ -97,6 +161,10 @@ def extract_charoption(text):
     out = []
     for mm in re.finditer(r'\{\s*"value":(-?\d+),\s*"name":"((?:[^"\\]|\\.)*)",\s*"id":"(\w+)"\s*\}', m.group(1)):
         out.append((int(mm.group(1)), mm.group(2), mm.group(3)))
+    for mm in re.finditer(r'charOption\.push\s*\(\s*\{(.*?)\}\s*\)\s*;', text, re.S):
+        pairs = dict(_parse_literal_pairs(mm.group(1)))
+        if all(k in pairs for k in ('value', 'name', 'id')):
+            out.append((int(pairs['value']), pairs['name'], pairs['id']))
     return out
 
 
@@ -105,7 +173,50 @@ def extract_charlistorder(text):
     m = re.search(r'charListOrder:Array\s*=\s*\[(.*?)\]', text, re.S)
     if not m:
         raise ValueError('charListOrder 未找到')
-    return re.findall(r'"([^"]+)"', m.group(1))
+    out = re.findall(r'"([^"]+)"', m.group(1))
+    out.extend(re.findall(r'charListOrder\.push\s*\(\s*"([^"]+)"\s*\)\s*;', text))
+    return out
+
+
+def build_inventory(global_text, select_text):
+    direct = extract_bindings(global_text)
+    links = extract_binding_links(global_text)
+    return VersionInventory(
+        pow=extract_pow(global_text),
+        langwords=extract_langwords(global_text),
+        char_options=extract_charoption(select_text),
+        char_list_order=extract_charlistorder(global_text),
+        binding_codes=resolve_binding_codes(direct, links),
+        sound_classes=extract_sound_classes(global_text),
+    )
+
+
+def extract_sound_classes(text):
+    out = {}
+    pattern = (
+        r'Console\.sfx\[(\d+)\]\s*=\s*new\s+(?:Game\.)?Sfx'
+        r'\s*\(\s*(?:new\s+)?([A-Za-z_]\w*)(?:\(\))?'
+    )
+    for m in re.finditer(pattern, text):
+        out[int(m.group(1))] = m.group(2)
+    return out
+
+
+def load_inventory(work_dir, ffdec_jar, exe_path):
+    key = export_cache_key(exe_path)
+    out_dir = os.path.join(work_dir, 'registry', key)
+    paths = ensure_exports(
+        work_dir,
+        ffdec_jar,
+        exe_path,
+        out_dir,
+        classes=('Data.Global', 'Web_misc.SelectCharPanel'),
+    )
+    with open(paths['Data.Global'], encoding='utf-8') as f:
+        global_text = f.read()
+    with open(paths['Web_misc.SelectCharPanel'], encoding='utf-8') as f:
+        select_text = f.read()
+    return build_inventory(global_text, select_text)
 
 
 def binding_target_map(src_bindings, dst_bindings):

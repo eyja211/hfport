@@ -348,6 +348,11 @@ class ItemClosure:
                 i = ival(z.props.get('i'))
                 if i >= 0:
                     self.limb_slots.add(i)
+        for key in ('upLimbs', 'lowLimbs'):
+            for value in arr_items(fr.props.get(key)):
+                i = ival(value)
+                if i >= 0:
+                    self.limb_slots.add(i)
         # 渲染引用帧（可能位于其他动作的帧段之外）
         for key in ('refIndex', 'refIndex_2'):
             r = ival(fr.props.get(key), 0)
