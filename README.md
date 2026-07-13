@@ -1,143 +1,140 @@
 # hfport
 
-**Hero Fighter Character Porter** is a source-only tool for moving selectable
-characters between compatible Hero Fighter game builds and mods.
+**简体中文** | [English](README.en.md)
 
-It analyzes a character's data dependencies, resolves name collisions, patches
-the target build's registration points, and writes a new output EXE without
-overwriting either input file.
+**Hero Fighter 角色移植工具**用于在兼容的 Hero Fighter 游戏版本与 mod
+之间移植玩家可选角色。它会分析角色依赖、处理资源重名、补齐目标版本的
+注册入口，并生成一个新的 EXE，不覆盖源文件或目标文件。
 
-> This repository deliberately does not contain Hero Fighter executables, SWF
-> files, game assets, FFDec, or generated ports.
+> 本仓库只发布工具源码，不包含 Hero Fighter EXE、SWF、游戏资源、
+> FFDec 或任何移植后的游戏成品。
 
-## What It Ports
+## 移植内容
 
-- Character SPT data and LMI textures
-- Referenced attacks and Pt templates from `globalDat`
-- Isolated copies of referenced item action groups, projectiles, and textures
-- Referenced sound assets when the target does not already contain them
-- Character-list and VS-selection registration
-- Experience binding to an existing target character
+- 角色 SPT 数据与 LMI 贴图
+- `globalDat` 中角色引用的攻击数据与 Pt 模板
+- 角色使用的 item 动作组、飞行道具和贴图的独立副本
+- 目标版本中不存在的角色音效资源
+- “角色一览”和 VS 选人列表注册
+- 绑定到目标版本已有角色的经验数据
 
-Every run gets a short source-derived namespace. If that namespace is already
-present in the target, hfport automatically allocates the next numbered variant.
-Item groups are always copied to new indices even when source and target use the
-same original `int1`; a ported character therefore cannot silently use the
-target mod's edited version of that item.
+每次移植都会根据源文件名生成一个简短命名空间。如果目标版本已经使用该
+命名空间，hfport 会自动分配下一个编号。角色引用的 item 组始终复制到新
+下标，即使源和目标使用相同的原始 `int1`，也不会误用目标 mod 修改过的
+同下标 item。
 
-## Compatibility
+## 兼容范围
 
-hfport is intended for the Hero Fighter family and compatible Flash-based mods;
-it is not restricted to one named mod or a single version label.
+hfport 面向 Hero Fighter 系列及采用兼容 Flash 数据布局的衍生 mod，
+不按某个 mod 名称或单一版本号写死。
 
-The current implementation expects a Windows Flash projector containing an
-embedded SWF and the usual Hero Fighter-style data and registration layout:
+当前实现要求输入为内嵌 SWF 的 Windows Flash projector，并保留常见的
+Hero Fighter 数据与注册结构：
 
-- `Data.Global_*` binary assets, including `globalDat`, `itemSpt`, and `itemLmi`
-- `Data.BgInfoFile` data loading
-- `Data.Global` character registration and experience initialization
-- `Web_misc.SelectCharPanel` character selection
-- `Page.CharList` character-list paging
+- `Data.Global_*` 二进制资源，包括 `globalDat`、`itemSpt` 和 `itemLmi`
+- `Data.BgInfoFile` 数据加载入口
+- `Data.Global` 角色注册与经验初始化
+- `Web_misc.SelectCharPanel` 选人列表
+- `Page.CharList` 角色一览翻页逻辑
 
-Different releases and heavily modified mods can change those layouts. Use a
-copy of the target, run the built-in structural validation, and complete the
-manual in-game checklist before treating a port as usable. The tool should not
-be read as a guarantee of compatibility with every Hero Fighter release or mod.
+不同版本或深度修改的 mod 可能改变这些结构。请始终使用目标文件副本，
+先通过工具的静态验证，再完成游戏内测试。本工具不能保证兼容所有
+Hero Fighter 版本和 mod。
 
-## Requirements
+## 环境要求
 
 - Windows
-- Python 3.8 or newer; no Python packages beyond the standard library
+- Python 3.8 或更高版本，仅使用标准库
 - Java
-- [JPEXS Free Flash Decompiler (FFDec)](https://github.com/jindrapetrik/jpexs-decompiler)
-  for extracting the small registration-code surface used by the tool
+- [JPEXS Free Flash Decompiler（FFDec）](https://github.com/jindrapetrik/jpexs-decompiler)，
+  用于提取工具需要的少量注册代码
 
-Place `ffdec.jar` at `FFDec/ffdec.jar`, or provide its path in a configuration
-file. Keep FFDec and game files outside Git; the supplied `.gitignore` handles
-the common local layout.
+将 `ffdec.jar` 放在 `FFDec/ffdec.jar`，或在配置文件中指定其路径。
+FFDec 和游戏文件应留在 Git 仓库之外，项目提供的 `.gitignore` 已覆盖
+常见的本地目录结构。
 
-## Quick Start
+## 快速开始
 
-1. Clone this repository.
-2. Put `FFDec/ffdec.jar` beside the source, or prepare an absolute FFDec path.
-3. Keep copies of your source and target game EXEs in a local working folder.
-4. Run either `移植工具.bat` or:
+1. 克隆本仓库。
+2. 准备 `FFDec/ffdec.jar`，或记录它的绝对路径。
+3. 在本地工作目录中准备源版本和目标版本 EXE 的副本。
+4. 双击 `移植工具.bat`，或者运行：
 
    ```powershell
    python -m hfport.cli
    ```
 
-5. Choose the source build, target build, and characters to import. A build that
-   was already extended by hfport can be used as either source or target.
-6. Review the static validation output, then test the generated EXE in-game.
+5. 选择源版本、目标版本和需要移植的角色。已经由 hfport 扩展过的版本，
+   也可以继续作为源或目标。
+6. 查看静态验证结果，并在游戏内完成实测。
 
-The tool writes a distinct output file under `output/` by default. It does not
-overwrite either selected input EXE.
+工具默认将新文件写入 `output/`，不会覆盖所选的源 EXE 或目标 EXE。
 
-## Non-Interactive Use
+## 配置运行
 
-Copy `examples/port-config.example.json`, replace every placeholder with your
-own local paths, then run:
+参考 `examples/port-config.example.json` 创建本地配置，替换其中的示例
+路径后运行：
 
 ```powershell
 python -m hfport.cli --config path\to\port-config.json
 ```
 
-To list selectable source characters without creating an output:
+只列出源版本中的可选角色，不执行移植：
 
 ```powershell
 python -m hfport.cli --list "C:\path\to\source-build.exe"
 ```
 
-## Validation
+## 验证
 
-After a build, hfport validates the generated projector/SWF structure, ABC
-round-trips, generated assets, major data references, and registration strings.
-Passing that validation is necessary but not sufficient: a final in-game check
-should cover loading, character list, VS selection, battle entry, animations,
-attacks, projectile/item behavior, textures, sounds, and experience binding.
+构建完成后，hfport 会检查生成的 projector/SWF 结构、ABC 往返一致性、
+新增资源、主要数据引用和角色注册字符串。通过静态验证只是必要条件，
+最终仍应在游戏中检查：
 
-The historical integration scripts in `hfport/tests/` require local game and
-FFDec files that are intentionally excluded from this repository. A source-only
-sanity check is available everywhere:
+- 游戏启动和战斗加载
+- 角色一览与 VS 选人
+- 动作、攻击和飞行道具
+- item 行为、贴图和音效
+- 经验绑定
+- 目标版本原有角色是否正常
+
+`hfport/tests/` 中的部分集成测试需要本地游戏文件和 FFDec，这些文件不会
+随公开仓库提供。任何环境都可以运行以下源码检查：
 
 ```powershell
 python -m compileall hfport
 python -m hfport.cli --help
 ```
 
-Registry exports are cached by the exact SHA-256 of each input EXE. Switching
-between mods cannot reuse another build's stale `pow`, binding, or selection data.
+FFDec 导出的注册清单会按输入 EXE 的完整 SHA-256 分目录缓存，因此切换
+不同版本时不会误用其他游戏留下的 `pow`、经验绑定或选人数据。
 
-## Repository Layout
+## 目录结构
 
 ```text
-hfport/                 Core parser, porter, registry patcher, and CLI
-hfport/tests/           Integration scripts for locally supplied game files
-examples/               Redacted configuration examples
-移植工具.bat             Windows launcher
-work/                   Generated scratch data (ignored)
-output/                 Generated ports and configs (ignored)
+hfport/                 解析、移植、注册补丁、验证与 CLI
+hfport/tests/           单元测试及需要本地游戏文件的集成测试
+examples/               已脱敏的配置示例
+移植工具.bat             Windows 双击启动入口
+work/                   自动生成的中间文件（Git 忽略）
+output/                 自动生成的移植产物与配置（Git 忽略）
 ```
 
-## Safety Notes
+## 安全说明
 
-- Work from copies of the source and target files.
-- Never publish game executables, SWFs, extracted assets, or generated ports
-  unless you have the rights to distribute them.
-- Both players need the same generated game build for multiplayer use.
-- Engine-level gameplay changes in a source mod are outside this tool's
-  data-porting scope and will continue to use the target build's engine logic.
+- 始终使用源文件和目标文件的副本。
+- 除非拥有合法分发权，否则不要发布游戏 EXE、SWF、提取资源或移植成品。
+- 联机玩家需要使用完全相同的生成版本。
+- 源 mod 中通过 AS3 引擎代码实现的特殊机制不属于数据移植范围，移植后
+  仍按照目标版本的引擎逻辑运行。
 
-## Contributing
+## 参与贡献
 
-Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull
-request. In particular, do not attach proprietary game files or extracted game
-assets to the repository, issues, or pull requests.
+提交 issue 或 pull request 前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+请勿在仓库、issue 或 pull request 中上传受版权保护的游戏文件或提取资源。
 
-## License
+## 许可证
 
-The source code in this repository is available under the [MIT License](LICENSE).
-Hero Fighter, game builds, game assets, and third-party tools remain the property
-of their respective owners. This project is not affiliated with or endorsed by
-those owners.
+本仓库源码采用 [MIT License](LICENSE)。Hero Fighter、各游戏版本、游戏
+资源和第三方工具的权利归各自所有者所有。本项目与相关权利方没有隶属或
+背书关系。
