@@ -1,6 +1,6 @@
 # hfport
 
-**简体中文** | [English](README.en.md)
+**简体中文** | [English](README.en.md) | [日本語](README.ja.md)
 
 **Hero Fighter 角色移植工具**用于在兼容的 Hero Fighter 游戏版本与 mod
 之间移植玩家可选角色。它会分析角色依赖、处理资源重名、补齐目标版本的

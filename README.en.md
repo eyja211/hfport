@@ -1,6 +1,6 @@
 # hfport
 
-[**简体中文**](README.md) | **English**
+[简体中文](README.md) | **English** | [日本語](README.ja.md)
 
 **Hero Fighter Character Porter** is a source-only tool for moving selectable
 characters between compatible Hero Fighter game builds and mods.
