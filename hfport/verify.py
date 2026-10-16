@@ -15,7 +15,184 @@ import sys, struct
 from . import abcpatch as A
 from . import amf as M
 from . import gamedata as G
+from . import loaders as L
 from . import swf as S
+
+
+def _check_load_hooks(f, manifest):
+    """校验产物中的实际调用，不让“新角色能显示”掩盖原生 SPT 引不到新贴图。"""
+    try:
+        lmis, spts = L.split_load_sequence(manifest.get('load_sequence', []))
+    except ValueError as exc:
+        return [str(exc)]
+    if not lmis and not spts:
+        return []
+    abc = _main_abc(f)
+    if abc is None:
+        return ['主 DoABC 未找到，无法验证资源加载阶段']
+    errs, calls = [], {}
+    specs = {'A': L.HOOK_A, 'native': ('Data', 'Global', 'LoadAllData'), 'B': L.HOOK_B}
+    for stage, spec in specs.items():
+        mi, _ = abc.find_class_method(*spec)
+        body = abc.body_of_method(mi) if mi is not None else None
+        if body is None:
+            errs.append('资源加载宿主缺失: %s.%s::%s' % spec)
+            calls[stage] = []
+        else:
+            calls[stage] = L.read_load_calls(abc, body)
+    expected = lmis + spts
+    classes = {cls for _, cls, _ in expected}
+    paths = {path for _, _, path in expected}
+    # 之前移植批次的调用不属于本次清单；但本次 class/path 的错配也不能被过滤掉。
+    own = {stage: [x for x in rows if x[1] in classes or x[2] in paths]
+           for stage, rows in calls.items()}
+    for stage, entries in (('A', lmis), ('B', spts)):
+        if own[stage] != entries:
+            errs.append('钩子 %s 资源加载调用/顺序错误: 预期 %r，实际 %r'
+                        % (stage, entries, own[stage]))
+        for entry in entries:
+            count = sum(rows.count(entry) for rows in calls.values())
+            if count != 1:
+                errs.append('资源 %s 加载 %d 次，预期恰好 1 次' % (entry[2], count))
+    if own['native']:
+        errs.append('本次资源误放进原生 LoadAllData: %r' % own['native'])
+    return errs
+
+
+def _check_item_route(f, manifest, report):
+    """独立 itemSpt 路由层的静态断言。
+
+    AVM2 verifier 拒类的表现是启动几秒静默退出，而结构检查全绿，所以这一层的每一条
+    改动都必须有对应断言。检查项：
+      1. 独立 item LMI 走 A，SPT 走 B（由 _check_load_hooks 校验），因为解析
+         SPT 的那一刻就把 spriteLimb.limbName 定死成 Global.limb[name]（Spt.as:1133），
+         顺序反了会一张贴图都不画且不报错。
+      2. 三个新槽位真的声明在对应类上，且类型索引是 0（`*`）。
+      3. Data.Global.ResolveItemSpt 存在，作用域深度与同类静态方法一致。
+      4. World.AddObjI 里不再有 sptHash["item"]，改成了 ResolveItemSpt 调用。
+      5. ObjH::Run / ObjI::Run 的后向分支数没变（ObjH::Run 里加一条后向分支就会让
+         SWF 加载失败），且注入点数量精确。
+    """
+    from . import itemroute as IR
+
+    errs = []
+    resource = manifest.get('item_lmi_resource') or {}
+    if not resource:
+        return errs
+    seq = [(k, c, p) for k, c, p in manifest.get('load_sequence', [])]
+    lmi_path = resource.get('lmi_path')
+    spt_path = resource.get('spt_path')
+    paths = [p for _, _, p in seq]
+    if lmi_path not in paths:
+        errs.append('独立 item LMI %s 不在 load_sequence 里' % lmi_path)
+    elif spt_path not in paths:
+        errs.append('独立 item SPT %s 不在 load_sequence 里' % spt_path)
+    elif paths.index(lmi_path) > paths.index(spt_path):
+        errs.append('独立 item LMI 排在了 item SPT 之后，移植 item 将无贴图')
+
+    abc = _main_abc(f)
+    if abc is None:
+        return errs + ['主 DoABC 未找到，无法验证路由层']
+
+    # 2. 新槽位
+    for pkg, cls, name in (('Data', 'Pt', IR.SLOT_PT_ROUTE),
+                           ('Game', 'ObjI', IR.SLOT_OBJI_ROUTE),
+                           ('Game', 'World', IR.SLOT_WORLD_HANDOFF)):
+        trait = abc.find_class_trait(pkg, cls, name, static=False, kinds=(0,))
+        if trait is None:
+            errs.append('%s.%s 缺少新槽位 %s' % (pkg, cls, name))
+            continue
+        if trait.data[1] != 0:
+            errs.append('%s.%s.%s 的类型不是 `*`（解析不到的类型会让类被拒）'
+                        % (pkg, cls, name))
+
+    # 3. 新方法
+    mi, trait = abc.find_class_method('Data', 'Global', IR.METHOD_RESOLVE, static=True)
+    if mi is None:
+        errs.append('Data.Global.%s 未声明' % IR.METHOD_RESOLVE)
+    else:
+        body = abc.body_of_method(mi)
+        expect = abc.dominant_scope_depths('Data', 'Global', static=True)
+        if body is None:
+            errs.append('Data.Global.%s 没有方法体' % IR.METHOD_RESOLVE)
+        elif (body.init_scope_depth, body.max_scope_depth) != expect:
+            errs.append('Data.Global.%s 的作用域深度 %r != 同类静态方法 %r'
+                        % (IR.METHOD_RESOLVE,
+                           (body.init_scope_depth, body.max_scope_depth), expect))
+
+    # 4. AddObjI
+    mi, _ = abc.find_class_method('Game', 'World', 'AddObjI', static=False)
+    if mi is None:
+        errs.append('Game.World::AddObjI 未找到')
+    else:
+        insns = list(A.walk_code(abc.body_of_method(mi).code))
+        item_lookup = 0
+        resolve_calls = 0
+        for k in range(len(insns)):
+            off, op, ops, nxt = insns[k]
+            if (op == 0x2C and abc.strings[ops[0]] == 'item'
+                    and k + 1 < len(insns) and insns[k + 1][1] == 0x66):
+                item_lookup += 1
+            if op == 0x46 and abc.mn_name(ops[0]) == IR.METHOD_RESOLVE:
+                resolve_calls += 1
+        if item_lookup:
+            errs.append('World.AddObjI 里还有 %d 处 sptHash["item"] 直查' % item_lookup)
+        if resolve_calls != 1:
+            errs.append('World.AddObjI 里 %s 调用 %d 处，预期 1 处'
+                        % (IR.METHOD_RESOLVE, resolve_calls))
+
+    # 5. 注入点数量 + 后向分支不变
+    route = (report or {}).get('item_route') or {}
+    expected_sites = {'Game.ObjH::Run': 2, 'Game.ObjI::Run': 2}
+    for key, want in expected_sites.items():
+        pkg_cls, meth = key.split('::')
+        pkg, cls = pkg_cls.split('.')
+        mi, _ = abc.find_class_method(pkg, cls, meth, static=False)
+        if mi is None:
+            errs.append('%s 未找到' % key)
+            continue
+        insns = list(A.walk_code(abc.body_of_method(mi).code))
+        sets = sum(1 for off, op, ops, nxt in insns
+                   if op == 0x61 and abc.mn_name(ops[0]) == IR.SLOT_WORLD_HANDOFF)
+        if sets != want:
+            errs.append('%s 里 hfpRoute 赋值 %d 处，预期 %d 处' % (key, sets, want))
+        back = sum(1 for off, op, ops, nxt in insns
+                   if A.OPCODES[op][1] == ['s24'] and (nxt + ops[0]) < off)
+        baseline = {'Game.ObjH::Run': 12, 'Game.ObjI::Run': 1}[key]
+        if back != baseline:
+            errs.append('%s 的后向分支数 %d != 原版 %d（ObjH::Run 多一条后向分支就会'
+                        '让 SWF 加载失败）' % (key, back, baseline))
+        starts = {off for off, _, _, _ in insns} | {len(abc.body_of_method(mi).code)}
+        bad = [off for off, op, ops, nxt in insns
+               if A.OPCODES[op][1] == ['s24'] and (nxt + ops[0]) not in starts]
+        if bad:
+            errs.append('%s 有 %d 个分支目标不在指令边界' % (key, len(bad)))
+    return errs
+
+
+def _main_abc(f):
+    for _, t in f.find_tags(S.TAG_DOABC):
+        _, name, abc_bytes = S.parse_doabc(t.body)
+        abc = A.AbcFile.parse(abc_bytes)
+        if abc.find_instance('Data', 'Global') is not None:
+            return abc
+    return None
+
+
+def _pushstrings(abc, package, cls, method, static=True):
+    mi, _ = abc.find_class_method(package, cls, method, static=static)
+    if mi is None:
+        return None
+    body = abc.body_of_method(mi)
+    if body is None:
+        return None
+    out = []
+    for _, op, ops, _ in A.walk_code(body.code):
+        if op == 0x2C:
+            value = abc.strings[ops[0]]
+            if isinstance(value, str):
+                out.append(value)
+    return out
 
 
 def verify(out_exe, report=None, log=print):
@@ -78,51 +255,56 @@ def verify(out_exe, report=None, log=print):
 
     if report:
         manifest = report.get('manifest', {})
-        target_counts = manifest.get('target_item_counts', {})
-        prefix_hashes = manifest.get('item_prefix_hashes', {})
-        seqs = {
-            'groups': groups,
-            'actions': G.arr_items(mv.item.props.get('action')),
-            'frames': G.arr_items(mv.item.props.get('frame')),
-            'slots': slots,
-        }
-        for key, count in target_counts.items():
-            count = int(count)
-            got = G.md5(b'|'.join(G.norm_obj_bytes(x) for x in seqs[key][:count]))
-            if got != prefix_hashes.get(key):
-                errs.append('目标原 item %s 前缀被修改' % key)
+        errs.extend(_check_load_hooks(f, manifest))
+        # 目标原有的 item 资源必须一个字节都没动（移植 item 全在独立包里）
+        item_hashes = manifest.get('target_item_hashes', {})
+        for cls, key in (('Data.Global_itemSpt', 'spt_payload_sha256'),
+                         ('Data.Global_itemLmi', 'lmi_payload_sha256')):
+            want = item_hashes.get(key)
+            if want and G.sha256(f.binary_payload(cls)) != want:
+                errs.append('目标 %s 载荷被改动了' % cls)
+        resource = manifest.get('item_lmi_resource') or {}
+        routed_groups = 0
+        if resource:
+            routed = G.SptFile.parse(
+                M.unwrap_payload(f.binary_payload(resource['spt_class']))).obj
+            routed_groups = len(G.arr_items(routed.props.get('actionGroup')))
+            if routed.props.get('id') != resource.get('spt_id'):
+                errs.append('独立 item SPT 的 id %r != 预期 %r'
+                            % (routed.props.get('id'), resource.get('spt_id')))
         mapped_groups = []
         for src_i, dst_i in manifest.get('item_group_map', {}).items():
             dst_i = int(dst_i)
             mapped_groups.append(dst_i)
-            if dst_i < int(target_counts.get('groups', 0)) or dst_i >= n_groups:
-                errs.append('移植 item 组 %s 映射到非法下标 %d' % (src_i, dst_i))
+            if not (0 <= dst_i < routed_groups):
+                errs.append('移植 item 组 %s 映射到独立包非法下标 %d' % (src_i, dst_i))
         if len(mapped_groups) != len(set(mapped_groups)):
-            errs.append('多个源 item 组映射到同一目标下标')
+            errs.append('多个源 item 组映射到同一下标')
         for src_i, dst_i in manifest.get('invalid_group_map', {}).items():
-            if int(dst_i) < n_groups:
-                errs.append('源悬空 item 组 %s 意外解析到目标下标 %s' % (src_i, dst_i))
+            if int(dst_i) < routed_groups:
+                errs.append('源悬空 item 组 %s 意外解析到独立包有效下标 %s' % (src_i, dst_i))
         for src_name, mapped in manifest.get('item_limb_map', {}).items():
             if mapped not in mv.limbs:
                 errs.append('移植 item 肢体缺失: %s -> %s' % (src_name, mapped))
-        runtime_pngs = {}
-        runtime_lmis = []
-        if 'lmi_data/item.lmi' in mv.lmis:
-            runtime_lmis.append(mv.lmis['lmi_data/item.lmi'])
-        for kind, cls, path in manifest.get('load_sequence', []):
-            if kind == 'lmi' and path in mv.lmis:
-                runtime_lmis.append(mv.lmis[path])
-        for lmi in runtime_lmis:
-            for idx, pic in enumerate(lmi.limb_pics):
-                filename = pic.props.get('filename')
-                if filename and lmi.pngs[idx] is not None:
-                    runtime_pngs[filename] = lmi.pngs[idx]
+        # 和引擎一致：A -> 原生 LMI -> B，按 filename 取最后注册的嵌入 PNG。
+        runtime_pngs = {name: entry[1] for name, entry in mv.pngs.items()}
         for mapped, expected_hash in manifest.get('copied_png_hashes', {}).items():
             got = runtime_pngs.get(mapped)
             if got is None:
                 errs.append('移植 PNG 缺失: %s' % mapped)
-            elif G.md5(got) != expected_hash:
+            elif G.sha256(got) != expected_hash:
+                # manifest 里存的是 sha256；早先这里用 md5 比，永远不相等。
                 errs.append('移植 PNG 内容不来自源版本: %s' % mapped)
+
+        # 目标原有 item 资源必须逐字节不变
+        item_hashes = manifest.get('target_item_hashes', {})
+        expected_lmi = item_hashes.get('lmi_payload_sha256')
+        if expected_lmi:
+            got = G.sha256(f.binary_payload('Data.Global_itemLmi'))
+            if got != expected_lmi:
+                errs.append('目标 Data.Global_itemLmi 载荷被改动了')
+
+        errs.extend(_check_item_route(f, manifest, report))
 
     # itemSpt 内部索引完整性
     actions = G.arr_items(mv.item.props.get('action'))

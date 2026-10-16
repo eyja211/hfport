@@ -2,8 +2,8 @@
 """总装配：数据合并 + 注册代码补丁 + SWF/EXE 输出。
 
 四个补丁点（全部“尾部追加”，不改动既有指令流）：
-  A Global.LoadGlobalDatFromCompressedBytes  -> pow/charListOrder/langWords/Console.sfx 注册
-  B Data.BgInfoFile.LoadFromCompressedBytes  -> 新 LMI/SPT 的加载调用（按 refSpt 拓扑序）
+  A Global.LoadGlobalDatFromCompressedBytes  -> pow/charListOrder/langWords/Console.sfx 注册 + 全部新 LMI
+  B Data.BgInfoFile.LoadFromCompressedBytes  -> 新 SPT 的加载调用（按 refSpt 拓扑序）
   C Global.InitPow                            -> 经验绑定 pow[new].c = pow[target].c（带空值守卫）
   D Web_misc.SelectCharPanel 的 cinit          -> charOption 追加（类内私有访问，无需改可见性）
 """
@@ -12,6 +12,8 @@ import json, os, struct
 from . import abcpatch as A
 from . import amf as M
 from . import gamedata as G
+from . import itemroute as IR
+from . import loaders as L
 from . import porter as P
 from . import registry as R
 from . import swf as S
@@ -54,6 +56,7 @@ class Builder:
         log('   源肢体 %d，目标肢体 %d' % (len(self.src.limbs), len(self.dst.limbs)))
 
         log('[2/8] 提取版本清单与预检...')
+        self.container_selfcheck = self._selfcheck_container(dst_swf, log)
         self._extract_registry()
 
         log('[3/8] 计算依赖闭包与冲突决策...')
@@ -64,6 +67,14 @@ class Builder:
         self.new_p, self.rep_p, self.manifest = porter.payloads()
         self.porter = porter
         log('   新增载荷 %d 个，替换载荷 %d 个' % (len(self.new_p), len(self.rep_p)))
+        # analyze() 末尾那次汇总只看得到闭包阶段的警告；transform 阶段还会加上每条
+        # cre 的解析结果、Piece 动作映射等。这里按最终清单再打一次。
+        digest = self.manifest.get('warning_digest') or {}
+        if digest:
+            log('   最终警告 %d 条 / %d 类：'
+                % (len(self.manifest['warnings']), len(digest)))
+            for kind, info in digest.items():
+                log('     %5d x %s' % (info['count'], kind))
         self.manifest['char_meta'] = self.char_meta
 
         log('[5/8] 生成注册代码补丁...')
@@ -90,11 +101,64 @@ class Builder:
             'dst_hash': self.dst_hash,
             'asset_abc_name': self.asset_abc_name,
             'charlist_pages': self.charlist_page_info,
+            'container_selfcheck': self.container_selfcheck,
+            'item_route': self.item_route_report,
         }
         rp = os.path.join(self.work, 'build_report.json')
         json.dump(report, open(rp, 'w', encoding='utf-8'), ensure_ascii=False, indent=1, default=str)
         log('构建报告: %s' % rp)
         return report
+
+    def _selfcheck_container(self, dst_swf_bytes, log):
+        """补丁全关的情况下重建目标 SWF，证明容器层没有丢信息。
+
+        这样"输出里和目标不同的每一个字节都是我们改的"才是个结论而不是希望。
+
+        比较对象是**规范化后的原始字节**，不是重建结果的再解析 —— 后者按构造必然
+        相等，那种写法只能看出容器差异，永远发现不了解析丢标签，属于不可能失败的检查。
+        CWS/ZWS 的规范形式就是 SwfFile.parse 内部实际解析的那段 FWS 字节。
+
+        三种结果：
+          identical         —— 与原始逐字节一致
+          compression-only  —— 与规范化原始逐字节一致，只是原容器是压缩的。
+                               游戏能读 FWS，只是文件变大；记警告不阻断。
+          content-differs   —— 规范化后仍不一致，说明解析/重发射丢了东西，直接失败。
+        """
+        rebuilt = self.dst.swf.build()
+        if rebuilt == dst_swf_bytes:
+            log('   容器自检: 逐字节一致 ✓')
+            return {'result': 'identical', 'orig_bytes': len(dst_swf_bytes),
+                    'rebuilt_bytes': len(rebuilt)}
+
+        sig = dst_swf_bytes[:3]
+        canonical = dst_swf_bytes
+        if sig in (b'CWS', b'ZWS'):
+            import zlib
+            try:
+                body = zlib.decompress(dst_swf_bytes[8:])
+            except Exception as exc:
+                raise RuntimeError('目标 SWF 容器无法解压，拒绝构建: %r' % (exc,))
+            canonical = (b'FWS' + dst_swf_bytes[3:4]
+                         + struct.pack('<I', 8 + len(body)) + body)
+
+        if rebuilt == canonical:
+            log('   容器自检: 与规范化原始逐字节一致；原容器 %s -> 重建为 FWS（%+d 字节）'
+                % (sig.decode('latin-1'), len(rebuilt) - len(dst_swf_bytes)))
+            return {'result': 'compression-only',
+                    'orig_signature': sig.decode('latin-1'),
+                    'was_compressed': sig in (b'CWS', b'ZWS'),
+                    'orig_bytes': len(dst_swf_bytes),
+                    'canonical_bytes': len(canonical),
+                    'rebuilt_bytes': len(rebuilt),
+                    'tags': len(self.dst.swf.tags)}
+
+        first = next((i for i in range(min(len(canonical), len(rebuilt)))
+                      if canonical[i] != rebuilt[i]), min(len(canonical), len(rebuilt)))
+        raise RuntimeError(
+            '目标 SWF 容器往返丢信息，拒绝构建（无法保证不破坏目标）：'
+            '规范化后 %d 字节 vs 重建 %d 字节，首个差异在偏移 %d'
+            % (len(canonical), len(rebuilt), first)
+        )
 
     # ------------------------------------------------------------ 注册数据
 
@@ -212,10 +276,6 @@ class Builder:
         mn_sfx = abc.qname_idx(0x16, '', 'sfx')
         mn_console = abc.qname_idx(0x16, '', 'Console')
         mn_gsfx = abc.qname_idx(0x16, 'Game', 'Sfx')
-        mn_lif = abc.qname_idx(0x16, 'Data', 'LimbInfoFile')
-        mn_spt = abc.qname_idx(0x16, 'Data', 'Spt')
-        mn_lfcb = abc.qname_idx(0x16, '', 'LoadFromCompressedBytes')
-        mn_ba = abc.qname_idx(0x16, 'flash.utils', 'ByteArray')
         mnl = self._find_public_mnl(abc)
 
         def push_value(asm, v):
@@ -264,21 +324,8 @@ class Builder:
         A.append_tail(abc, abc.body_of_method(mi), code_a, asm.max_stack)
         self.log('   A 注册尾部: %d 字节 (max_stack %d)' % (len(code_a), asm.max_stack))
 
-        # ---- B: 加载调用 ----
-        asm = A.Asm(abc)
-        for kind, cls, path in self.manifest['load_sequence']:
-            short = cls.split('.')[-1]
-            asm.getlex(mn_lif if kind == 'lmi' else mn_spt)
-            asm.getlex(abc.qname_idx(0x16, 'Data', short))
-            asm.construct(0)
-            asm.getlex(mn_ba)
-            asm._op(0x87, stack_delta=-1)                # astypelate
-            asm.pushstring(path)
-            asm.callpropvoid(mn_lfcb, 2)
-        code_b = asm.finish()
-        mi, _ = abc.find_class_method('Data', 'BgInfoFile', 'LoadFromCompressedBytes')
-        A.append_tail(abc, abc.body_of_method(mi), code_b, asm.max_stack)
-        self.log('   B 加载尾部: %d 字节 (%d 个加载调用)' % (len(code_b), len(self.manifest['load_sequence'])))
+        # 原生角色和 item SPT 在 B 之前就绑定 limbName；新 LMI 必须全部走 A。
+        L.append_load_hooks(abc, self.manifest['load_sequence'], log=self.log)
 
         # ---- C: 经验绑定 ----
         mn_calcpow = abc.qname_idx(0x16, '', 'CalcPow')
@@ -335,6 +382,11 @@ class Builder:
 
         # ---- E: 角色一览翻页扩容 ----
         self._patch_charlist_pages(abc)
+
+        # ---- F: 独立 itemSpt 的运行时路由 ----
+        self.item_route_report = None
+        if self.manifest.get('item_lmi_resource'):
+            self.item_route_report = IR.apply_item_route(abc, log=self.log)
 
         # 重建 DoABC 标签
         new_abc = abc.build()

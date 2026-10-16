@@ -441,6 +441,22 @@ class AbcFile:
         self.multinames.append((kind, (nsi, ni)))
         return len(self.multinames) - 1
 
+    def mn_name(self, i):
+        """multiname 索引 -> 裸名字（不含命名空间），无名则 None。
+
+        QName 的名字在 f[1]，命名空间集 Multiname 的名字在 f[0]。把两者混起来
+        会让 `getproperty int1` 被读成别的字段——ObjH::Run 用的正是 ns-set
+        Multiname，而 ObjI::Run 用的是 QName。诊断和锚点都必须走这个函数。
+        """
+        if i == 0 or self.multinames[i] is None:
+            return None
+        kind, f = self.multinames[i]
+        if kind in (MN_QName, MN_QNameA):
+            return self.strings[f[1]]
+        if kind in (MN_Multiname, MN_MultinameA):
+            return self.strings[f[0]]
+        return None
+
     def mn_str(self, i):
         """multiname 索引 -> 可读名（诊断用）。"""
         if i == 0:
@@ -486,6 +502,138 @@ class AbcFile:
                 if mn and mn[0] in (MN_QName, MN_QNameA) and self.strings[mn[1][1]] == method_name:
                     return t.data[1], t
         return None, None
+
+    def find_class_trait(self, package, cls_name, trait_name, static=False,
+                         kinds=None):
+        """Return a class trait by its exact public QName.
+
+        ``kinds`` contains low-nibble trait kinds (slot=0, method=1, ...).
+        This deliberately does not fall back to a bare-name/namespace-set match:
+        injected AVM2 must use the QName actually declared by the class.
+        """
+        ci = self.find_instance(package, cls_name)
+        if ci is None:
+            return None
+        qname = self.qname_idx(0x16, '', trait_name, add=False)
+        traits = self.classes[ci][1] if static else self.instances[ci]['traits']
+        for trait in traits:
+            if trait.name == qname and (kinds is None or (trait.kind & 0x0F) in kinds):
+                return trait
+        return None
+
+    def add_instance_slot(self, package, cls_name, name, type_package='',
+                          type_name='*', trait_kind=0x00):
+        """Add one public instance slot and return its QName index.
+
+        slot_id 必须跟着这个类现有的约定走。HF 的 ABC 是 Flex 输出，**每个 slot
+        trait 的 slot_id 都是 0**（交给 AVM2 顺序自动分配）；这时候新槽位也必须写 0，
+        写 max+1 会和第一个自动分配到的槽位撞号，整个类被 verifier 拒掉（表现是启动
+        几秒静默退出，而所有结构检查都是绿的）。只有本来就用显式编号的类才 max+1。
+        """
+        ci = self.find_instance(package, cls_name)
+        if ci is None:
+            raise KeyError('%s.%s' % (package, cls_name))
+        qname = self.qname_idx(0x16, '', name)
+        for trait in self.instances[ci]['traits']:
+            if trait.name == qname:
+                raise ValueError('%s.%s already declares public trait %s' % (
+                    package, cls_name, name
+                ))
+        existing = [t.data[0] for t in self.instances[ci]['traits']
+                    if (t.kind & 0x0F) in (0, 6)]
+        slot_id = 0 if (not existing or max(existing) == 0) else max(existing) + 1
+        type_qname = (0 if type_name == '*'
+                      else self.qname_idx(0x16, type_package, type_name))
+        self.instances[ci]['traits'].append(
+            Trait(qname, trait_kind, (slot_id, type_qname, 0), [])
+        )
+        return qname
+
+    def dominant_scope_depths(self, package, cls_name, static=False):
+        """(init_scope_depth, max_scope_depth) shared by most methods of a class.
+
+        Returns None when the class declares no method bodies to copy from.
+        """
+        ci = self.find_instance(package, cls_name)
+        if ci is None:
+            return None
+        traits = self.classes[ci][1] if static else self.instances[ci]['traits']
+        tally = {}
+        for trait in traits:
+            if (trait.kind & 0x0F) not in (1, 2, 3):
+                continue
+            body = self.body_of_method(trait.data[1])
+            if body is None:
+                continue
+            key = (body.init_scope_depth, body.max_scope_depth)
+            tally[key] = tally.get(key, 0) + 1
+        if not tally:
+            return None
+        return max(tally.items(), key=lambda kv: kv[1])[0]
+
+    def add_class_method(self, package, cls_name, name, param_types,
+                         return_type=0, static=False, code=b'', max_stack=1,
+                         local_count=None, init_scope_depth=None,
+                         max_scope_depth=None, flags=0, trait_kind=None):
+        """Add a public method trait, method_info and MethodBody.
+
+        Type entries are multiname indices. ``local_count`` includes ``this``
+        plus parameters for instance methods, and local0 plus parameters for
+        static methods, matching the ABC method-body convention.
+        """
+        ci = self.find_instance(package, cls_name)
+        if ci is None:
+            raise KeyError('%s.%s' % (package, cls_name))
+        qname = self.qname_idx(0x16, '', name)
+        traits = self.classes[ci][1] if static else self.instances[ci]['traits']
+        if any(t.name == qname for t in traits):
+            raise ValueError('%s.%s already declares public trait %s' % (
+                package, cls_name, name
+            ))
+
+        method_idx = len(self.methods)
+        self.methods.append({
+            'return_type': return_type,
+            'param_types': list(param_types),
+            'name': 0,
+            'flags': flags,
+        })
+        if local_count is None:
+            local_count = len(param_types) + 1
+        if init_scope_depth is None or max_scope_depth is None:
+            # These Flex-nested classes do not enter at depth 1: Data.Global's
+            # statics enter at 3, Game.World's instance methods at 4, ObjH's at
+            # 5. Declaring the wrong depth is a verify error that kills the whole
+            # class, so take it from a sibling of the same class and kind.
+            sibling = self.dominant_scope_depths(package, cls_name, static=static)
+            if sibling is None:
+                raise RuntimeError(
+                    '%s.%s 没有可参照的同类方法作用域深度' % (package, cls_name)
+                )
+            if init_scope_depth is None:
+                init_scope_depth = sibling[0]
+            if max_scope_depth is None:
+                max_scope_depth = sibling[1]
+        body = MethodBody(
+            method_idx, max_stack, local_count, init_scope_depth,
+            max_scope_depth, bytes(code), [], []
+        )
+        self.bodies.append(body)
+
+        if trait_kind is None:
+            trait_kind = 0x11 if static else 0x01
+        if static:
+            dispatch_id = max(
+                (t.data[0] for t in traits
+                 if (t.kind & 0x0F) in (1, 2, 3)),
+                default=0,
+            ) + 1
+        else:
+            # The target compiler uses disp_id=0 for ordinary instance methods.
+            dispatch_id = 0
+        trait = Trait(qname, trait_kind, (dispatch_id, method_idx), [])
+        traits.append(trait)
+        return method_idx, trait, body
 
 
 # ------------------------------------------------------------- 反汇编支撑
@@ -597,6 +745,149 @@ def walk_code(code):
         yield start, op, operands, p
 
 
+def _encode_instruction(op, operands, branch_values=None):
+    """Encode one instruction; branch_values replaces relative branch operands."""
+    out = bytearray([op])
+    spec = OPCODES[op][1]
+    values = list(operands)
+    if branch_values is not None:
+        values = list(branch_values)
+    if spec == ['switch']:
+        if not values:
+            raise ValueError('lookupswitch without offsets')
+        case_count = values[-1]
+        rels = values[:-1]
+        if len(rels) != case_count + 2:
+            raise ValueError('lookupswitch case table length mismatch')
+        out += write_s24(rels[0])
+        out += write_u30(case_count)
+        for rel in rels[1:]:
+            out += write_s24(rel)
+        return bytes(out)
+    for kind, value in zip(spec, values):
+        if kind == 'u30':
+            out += write_u30(value)
+        elif kind == 'u8':
+            out.append(value & 0xFF)
+        elif kind == 's24':
+            out += write_s24(value)
+        else:
+            raise ValueError('unsupported operand kind %s' % kind)
+    if len(values) != len(spec):
+        raise ValueError('operand count mismatch for opcode 0x%02X' % op)
+    return bytes(out)
+
+
+def rewrite_code(body, before=None, replace=None, after=None):
+    """Re-emit a method after instruction-boundary edits.
+
+    ``before``/``after`` map an old instruction offset to a list of
+    ``(opcode, operands)`` tuples. ``replace`` maps an old offset to the same
+    shape and replaces that original instruction; an empty list deletes it.
+    Inserted/replacement instructions must be branch-free; every original
+    branch, lookupswitch and exception range is relocated automatically.
+
+    A branch or exception boundary that pointed at a deleted instruction ends
+    up pointing at whatever is emitted next, so only delete instructions that
+    belong to an expression nothing jumps into.
+    """
+    before = before or {}
+    replace = replace or {}
+    after = after or {}
+    parsed = list(walk_code(body.code))
+    starts = {off for off, _, _, _ in parsed}
+    boundaries = starts | {len(body.code)}
+    edit_offsets = set(before) | set(replace) | set(after)
+    bad = sorted(edit_offsets - starts)
+    if bad:
+        raise ValueError('edits are not on instruction boundaries: %r' % bad)
+
+    def normalize(specs, label):
+        out = []
+        for spec in specs:
+            if not (isinstance(spec, tuple) and len(spec) == 2):
+                raise TypeError('%s instruction must be (opcode, operands)' % label)
+            op, operands = spec
+            if op not in OPCODES:
+                raise ValueError('unknown inserted opcode 0x%02X' % op)
+            if 's24' in OPCODES[op][1] or 'switch' in OPCODES[op][1]:
+                raise ValueError('%s may not contain branch instructions' % label)
+            out.append((op, list(operands), None))
+        return out
+
+    records = []
+    old_to_new = {}
+    new_size = 0
+    for off, op, operands, nxt in parsed:
+        # A branch or exception landing on the old instruction must execute an
+        # inserted-before block too, so map before adding those records.
+        old_to_new[off] = new_size
+        for rec in normalize(before.get(off, ()), 'before'):
+            records.append(rec)
+            new_size += len(_encode_instruction(rec[0], rec[1]))
+
+        if off in replace:
+            reps = normalize(replace[off], 'replace')
+            for rec in reps:
+                records.append(rec)
+                new_size += len(_encode_instruction(rec[0], rec[1]))
+        else:
+            branch_targets = None
+            spec = OPCODES[op][1]
+            if spec == ['s24']:
+                target = nxt + operands[0]
+                if target not in boundaries:
+                    raise ValueError('branch at %d targets non-boundary %d' % (off, target))
+                branch_targets = [target]
+            elif spec == ['switch']:
+                case_count = operands[-1]
+                branch_targets = [off + rel for rel in operands[:-1]]
+                if any(target not in boundaries for target in branch_targets):
+                    raise ValueError('lookupswitch at %d targets non-boundary' % off)
+                branch_targets.append(case_count)
+            records.append((op, list(operands), (off, nxt, branch_targets)))
+            new_size += len(_encode_instruction(op, operands))
+
+        for rec in normalize(after.get(off, ()), 'after'):
+            records.append(rec)
+            new_size += len(_encode_instruction(rec[0], rec[1]))
+    old_to_new[len(body.code)] = new_size
+
+    emitted = bytearray()
+    for op, operands, original in records:
+        if original is None or original[2] is None:
+            emitted += _encode_instruction(op, operands)
+            continue
+        old_off, old_next, targets = original
+        if OPCODES[op][1] == ['s24']:
+            new_next = len(emitted) + 4
+            rel = old_to_new[targets[0]] - new_next
+            emitted += _encode_instruction(op, operands, [rel])
+        elif OPCODES[op][1] == ['switch']:
+            new_off = len(emitted)
+            case_count = targets[-1]
+            rels = [old_to_new[target] - new_off for target in targets[:-1]]
+            emitted += _encode_instruction(op, operands, rels + [case_count])
+        else:
+            emitted += _encode_instruction(op, operands)
+
+    remapped_exceptions = []
+    for exc in body.exceptions:
+        if not (isinstance(exc, tuple) and len(exc) == 5):
+            raise ValueError('exception entry is not a five-tuple: %r' % (exc,))
+        frm, to, target, exc_type, var_name = exc
+        for value in (frm, to, target):
+            if value not in old_to_new:
+                raise ValueError('exception boundary %d is not an instruction boundary' % value)
+        remapped_exceptions.append((
+            old_to_new[frm], old_to_new[to], old_to_new[target],
+            exc_type, var_name,
+        ))
+    body.code = bytes(emitted)
+    body.exceptions = remapped_exceptions
+    return old_to_new
+
+
 class Asm:
     """直线代码汇编器：追踪栈深，支持前向标签。"""
 
@@ -625,12 +916,33 @@ class Asm:
     def getlex(self, mn):
         self._op(0x60, mn, stack_delta=1)
 
+    def getlocal(self, index):
+        if 0 <= index <= 3:
+            self._op(0xD0 + index, stack_delta=1)
+        else:
+            self._op(0x62, index, stack_delta=1)
+
+    def setlocal(self, index):
+        if 0 <= index <= 3:
+            self._op(0xD4 + index, stack_delta=-1)
+        else:
+            self._op(0x63, index, stack_delta=-1)
+
+    def pushscope(self):
+        self._op(0x30, stack_delta=-1)
+
+    def findpropstrict(self, mn):
+        self._op(0x5D, mn, stack_delta=1)
+
     def getproperty(self, mn, name_on_stack=0):
         # 弹 obj(+运行时名) 压值
         self._op(0x66, mn, stack_delta=-name_on_stack)
 
     def setproperty(self, mn, name_on_stack=0):
         self._op(0x61, mn, stack_delta=-(2 + name_on_stack))
+
+    def initproperty(self, mn, name_on_stack=0):
+        self._op(0x68, mn, stack_delta=-(2 + name_on_stack))
 
     def pushstring(self, s):
         self._op(0x2C, self.abc.str_idx(s), stack_delta=1)
@@ -666,6 +978,9 @@ class Asm:
     def pushnull(self):
         self._op(0x20, stack_delta=1)
 
+    def coerce_s(self):
+        self._op(0x85)
+
     def dup(self):
         self._op(0x2A, stack_delta=1)
 
@@ -695,6 +1010,12 @@ class Asm:
 
     def coerce(self, mn):
         self._op(0x80, mn)
+
+    def add(self):
+        self._op(0xA0, stack_delta=-1)
+
+    def throw(self):
+        self._op(0x03, stack_delta=-1)
 
     def returnvoid(self):
         self._op(0x47)

@@ -11,10 +11,12 @@ import re
 
 from . import amf as M
 from . import gamedata as G
+from . import loaders as L
 
 UND = M.UNDEFINED
 
 _NS_STOP_WORDS = {'hf', 'hero', 'fighter', 'of', 'the', 'v', 'version'}
+_NAMESPACE_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,31}$')
 
 
 def sanitize_namespace(value):
@@ -24,6 +26,15 @@ def sanitize_namespace(value):
     if value[0].isdigit():
         value = 'p' + value
     return value[:12]
+
+
+def validate_namespace(value):
+    if not isinstance(value, str) or not _NAMESPACE_RE.fullmatch(value):
+        raise ValueError(
+            'namespace 必须是 1-32 位 ASCII 标识符 '
+            '([A-Za-z_][A-Za-z0-9_]*): %r' % (value,)
+        )
+    return value
 
 
 def derive_namespace(exe_path):
@@ -67,7 +78,7 @@ def allocate_namespace(
 class Plan:
     def __init__(self, chars, namespace='port', display_suffix=' (Port)'):
         self.chars = chars                  # 源槽位 id 列表（不含 model0）
-        self.namespace = sanitize_namespace(namespace)
+        self.namespace = validate_namespace(namespace)
         self.id_suffix = '_' + self.namespace
         self.name_suffix = '@' + self.namespace
         self.display_suffix = display_suffix
@@ -100,6 +111,12 @@ class Porter:
         self.slot_map = {}      # itemSpt spriteLimb 源槽位 -> 目标槽位
         self.warnings = []
         self.invalid_group_map = {}
+        self.routed_cre_count = 0
+        self.dangling_groups = set()
+        # 移植 item 的贴图单独装一个 LMI，目标原 itemLmi 保持原字节。路径要在
+        # _merge_items 里就能引用，所以在这里定好。
+        self.item_lmi_path_planned = 'lmi_data/%s_item.lmi' % self.plan.namespace
+        self.item_spt_path_planned = 'spt_data/%s_item.spt' % self.plan.namespace
 
     # ================================================== 闭包与决策
 
@@ -119,7 +136,7 @@ class Porter:
         for cid in port_ids:
             spt = src.spt(cid)
             limbs |= G.spt_limb_names(spt)
-            r = G.spt_refs(spt)
+            r = G.spt_refs(spt, src)
             self.char_refs[cid] = r
             attacks |= r['attacks']
             pt_names |= r['pt_names']
@@ -127,6 +144,7 @@ class Porter:
             pt_idx |= r['pt_indexes']
             int1 |= r['int1']
             sfx |= r['sfx']
+            self.warnings.extend(self._format_pt_warning(x) for x in r['resolution_warnings'])
 
         nm2, cre2, bad = G.resolve_pt_indexes(src, pt_idx)
         pt_names |= nm2
@@ -160,11 +178,19 @@ class Porter:
         sfx |= clo.sfx
         attacks = G.expand_attack_chains(src, attacks)
         self.item_clo = clo
+        self.warnings.extend(self._format_pt_warning(x) for x in clo.resolution_warnings)
+        self.cre_resolutions = {
+            cid: [x.report() for x in self.char_refs[cid]['pt_resolutions']]
+            for cid in self.char_refs
+        }
+        self.item_cre_resolutions = [x.report() for x in clo.pt_resolutions]
 
-        # 道具肢体（来自 itemSpt.spriteLimb 槽位）
+        # 道具肢体（来自 itemSpt.spriteLimb 槽位）。
+        # _merge_items 现在整包 1:1 复制，所以这里要收**全部**槽位的 limb，
+        # 不能只收闭包用到的那几个——否则复制过来的槽位会指向不存在的 limb。
         item_slimbs = G.arr_items(src.item.props.get('spriteLimb'))
         item_limb_names = set()
-        for i in clo.limb_slots:
+        for i in range(len(item_slimbs)):
             if 0 <= i < len(item_slimbs) and isinstance(item_slimbs[i], M.AmfObj):
                 sl = item_slimbs[i]
                 if sl.props.get('limbName'):
@@ -187,6 +213,36 @@ class Porter:
         self._decide_sfx()
         self._summary()
         return self
+
+    @staticmethod
+    def _format_pt_warning(value):
+        if isinstance(value, dict):
+            return 'Pt 解析警告: %s' % value
+        return 'Pt 解析警告: %r' % (value,)
+
+    def warning_digest(self, samples=3):
+        """把警告按种类聚成计数 + 少量样本。
+
+        一次 22 人移植会产生上千条逐条警告（HF-EX 的 Pt 表是空的，每个 cat/ite/cre
+        都会报一次 ref 越界），直接打出来会把真正值得看的那几条淹掉。
+        """
+        buckets = {}
+        for w in self.warnings:
+            kind = None
+            for marker in ("{'kind': '", '"kind": "'):
+                if marker in w:
+                    rest = w.split(marker, 1)[1]
+                    kind = 'Pt 解析警告: ' + rest.split("'", 1)[0].split('"', 1)[0]
+                    break
+            if kind is None:
+                # 其余警告按"冒号前的说明"归类，否则每个具体下标都会自成一类。
+                head = w.split(': ', 1)[0]
+                kind = head if len(head) <= 40 else head[:40]
+            entry = buckets.setdefault(kind, {'count': 0, 'samples': []})
+            entry['count'] += 1
+            if len(entry['samples']) < samples:
+                entry['samples'].append(w)
+        return dict(sorted(buckets.items(), key=lambda kv: -kv[1]['count']))
 
     def _collect_spt_dependencies(self, roots):
         """按源 SPT 的真实 refSpt 递归收集依赖，依赖排在使用者之前。"""
@@ -420,16 +476,20 @@ class Porter:
         st['groups_copy'] = len(self.group_copy)
         st['new_sounds'] = len(getattr(self, 'new_sounds', []))
         self.log('闭包决策: %s' % st)
-        for w in self.warnings[:12]:
-            self.log('  警告: %s' % w)
-        if len(self.warnings) > 12:
-            self.log('  ...共 %d 条警告' % len(self.warnings))
+        digest = self.warning_digest()
+        if digest:
+            self.log('  警告合计 %d 条，按种类：' % len(self.warnings))
+            for kind, info in digest.items():
+                self.log('    %5d x %s' % (info['count'], kind))
+                self.log('          例: %s' % info['samples'][0])
 
     # ================================================== 变换与合并
 
     def transform(self):
-        self._merge_items()      # 先合并道具（分配组下标供 gdat/角色 int1 重映射）
+        # gdat 先合并：_merge_items 里的 item 帧也要按名字把 cat/ite 的 Pt 模板重指
+        # 到目标索引，这需要 out_pt_indices 已经就绪。
         self._merge_gdat()
+        self._merge_items()
         self._prepare_lmi_layout()
         self._build_char_spts()
         self._build_lmis()
@@ -451,15 +511,12 @@ class Porter:
         for nm in sorted(self.pt_copy):
             p = M.deep_clone(src.pt_by_name[nm][1])
             p.props['name'] = self.pt_map[nm]
-            if nm in self.pt_cre_ctx:
-                i1 = G.ival(p.props.get('int1'), -1)
-                if i1 >= 0:
-                    p.props['int1'] = float(self._map_group(i1))
             self.pt_new_idx[self.pt_map[nm]] = len(self.out_pts)
             self.out_pts.append(p)
         # 修 copied 条目的 ref/refName 链到目标索引
         dst_atk_idx = {a.props.get('name'): i for i, a in enumerate(self.out_attacks) if a.props.get('name')}
         dst_pt_idx = {p.props.get('name'): i for i, p in enumerate(self.out_pts) if p.props.get('name')}
+        self.out_pt_indices = dict(dst_pt_idx)
         for nm in self.attack_copy:
             a = self.out_attacks[self.attack_new_idx[self.attack_map[nm]]]
             self._fix_named_ref(a, self.src.gdat.attacks, self.attack_map, dst_atk_idx)
@@ -488,155 +545,233 @@ class Porter:
                 self.warnings.append('copied 条目数字 ref 指向无名条目，已置 -1')
 
     def _map_group(self, gi):
-        got = self.group_map.get(gi)
-        if got is None:
-            if gi in self.invalid_group_map:
-                return self.invalid_group_map[gi]
-            self.warnings.append('int1 组 %d 不在闭包内，未重映射' % gi)
-            return gi
-        return got
+        """源组号 -> 独立包组号。整包 1:1 复制，所以是恒等映射。
+
+        源里本来就越界/指向空组的组号（例如 HFEP 的 skadi 有 int1=598，而 HFEP 只有
+        589 组）**原样保留** —— 这才是忠实复制"源里这一发就是打不出东西"。引擎
+        `Obj.SetA` 对 `tempA == null` 有兜底（回落到组 0 并 trace），不会崩。
+        """
+        if gi in self.group_map:
+            return self.group_map[gi]
+        self.dangling_groups.add(gi)
+        return gi
 
     # ---- itemSpt / itemLmi ----
 
     def _merge_items(self):
-        src, dst = self.src, self.dst
-        self.out_item = M.deep_clone(dst.item)
-        d_groups = G.arr_items(self.out_item.props.get('actionGroup'))
-        d_actions = G.arr_items(self.out_item.props.get('action'))
-        d_frames = G.arr_items(self.out_item.props.get('frame'))
-        d_slots = G.arr_items(self.out_item.props.get('spriteLimb'))
+        """构造独立 item SPT：**下标与源 1:1 全量复制**，只改名字和跨包引用。
+
+        为什么不做密排重编号（这是踩过的坑）：
+        `ObjI::Run` 会在动作帧之外**按 fi 偏移**去取旋转/斜向变体（`ai == C._45 ||
+        ai == C._90` 那条分支里 `++fi`），也就是说"某个动作 last 帧之后紧跟着什么帧"
+        是引擎依赖的数据，不只是数组顺序。密排以后 easonball 飞行动作 last 帧后面
+        原本是 6 帧 ball1/ball2 变体，被换成了爆炸帧 —— 玩家看到的就是飞行贴图和爆炸
+        贴图不断交替。同理 action 下标（`actionIndex` 里可能出现同一 action 多次）和
+        组下标（子道具靠 `int1`）都保持原值最安全。
+
+        代价只是带上一些用不到的组：source 全量 90 组 vs 闭包 57 组，载荷差十几 KB。
+        贴图不多花——limb 本来就是整条 `limbPicIndex` 复制的。
+        """
+        src = self.src
         s_groups = G.arr_items(src.item.props.get('actionGroup'))
         s_actions = G.arr_items(src.item.props.get('action'))
         s_frames = G.arr_items(src.item.props.get('frame'))
         s_slots = G.arr_items(src.item.props.get('spriteLimb'))
 
-        # 1) spriteLimb 槽位映射
-        for i in sorted(self.item_clo.limb_slots):
-            if not (0 <= i < len(s_slots)) or not isinstance(s_slots[i], M.AmfObj):
-                self.slot_map[i] = i
-                continue
-            c = M.deep_clone(s_slots[i])
-            self._map_spritelimb(c)
-            self.slot_map[i] = len(d_slots)
-            d_slots.append(c)
+        self.out_item = M.deep_clone(src.item)
+        self.out_item.props['id'] = 'item_%s' % self.plan.namespace
+        self.out_item.props['name'] = 'Item@%s' % self.plan.namespace
+        # refSpt 只有在帧带 rsn/rsi 时才被读（Spt.as:1166-1209）。
+        rs = src.item.props.get('refSpt')
+        if isinstance(rs, str) and rs and rs not in self.dst.spts_available():
+            if rs in self.port_ids:
+                self.out_item.props['refSpt'] = self.plan.new_id(rs)
+            else:
+                self.warnings.append(
+                    '独立 item SPT 的 refSpt %r 在目标里不存在且未被移植，已清空' % rs)
+                self.out_item.props['refSpt'] = ''
+        self.out_item.props['lmiFiles'] = G.new_ecma([self.item_lmi_path_planned])
 
-        # 2) 分配复制组的目标下标
-        next_g = len(d_groups)
-        for gi in sorted(self.group_copy):
-            self.group_map[gi] = next_g
-            next_g += 1
-        for offset, gi in enumerate(sorted(self.need['groups'] - self.group_copy)):
-            self.invalid_group_map[gi] = next_g + offset
-
-        # 3) 收集复制组的动作/帧集合（含 refIndex 链）
-        copy_actions = set()
-        copy_frames = set()
-
-        def visit_frame(fi):
-            if fi in copy_frames or not (0 <= fi < len(s_frames)) or s_frames[fi] is None:
-                return
-            copy_frames.add(fi)
-            fr = s_frames[fi]
-            for key in ('refIndex', 'refIndex_2'):
-                r = G.ival(fr.props.get(key), 0)
-                if r > 0:
-                    visit_frame(r)
-
-        for gi in sorted(self.group_copy):
-            g = s_groups[gi]
-            if g is None:
-                continue
-            for cat in G.arr_items(g.props.get('actionIndex')):
-                for aiv in G.arr_items(cat):
-                    ai = G.ival(aiv)
-                    if 0 <= ai < len(s_actions) and s_actions[ai] is not None:
-                        copy_actions.add(ai)
-                        for fi in G.frames_of_action(s_frames, s_actions[ai]):
-                            visit_frame(fi)
-
-        action_map = {}
-        for ai in sorted(copy_actions):
-            action_map[ai] = len(d_actions) + len(action_map)
-        frame_map = {}
-        for fi in sorted(copy_frames):
-            frame_map[fi] = len(d_frames) + len(frame_map)
-
-        # 4) 复制并重写帧
-        for fi in sorted(copy_frames):
-            fr = M.deep_clone(s_frames[fi])
-            fr.props['index'] = float(frame_map[fi])
-            for key in ('refIndex', 'refIndex_2'):
-                r = G.ival(fr.props.get(key), 0)
-                if r > 0:
-                    fr.props[key] = float(frame_map.get(r, 0))
-            self._fix_frame_refs(fr, item_ctx=True)
-            d_frames.append(fr)
-
-        # 5) 复制并重写动作
-        for ai in sorted(copy_actions):
-            act = M.deep_clone(s_actions[ai])
-            fi = G.ival(act.props.get('frameIndex'))
-            if fi in frame_map:
-                act.props['frameIndex'] = float(frame_map[fi])
-            akt = act.props.get('a_keyTgr')
-            if akt is not None and akt is not UND:
-                for kt in G.arr_items(akt):
-                    if isinstance(kt, M.AmfObj):
-                        agi = G.ival(kt.props.get('agi'))
-                        if agi in self.group_map:
-                            kt.props['agi'] = float(self.group_map[agi])
-            d_actions.append(act)
-
-        # 6) 复制并重写组
-        used_group_names = {
-            group.props.get('name')
-            for group in d_groups
-            if isinstance(group, M.AmfObj) and group.props.get('name')
-        }
-        for gi in sorted(self.group_copy):
-            g = M.deep_clone(s_groups[gi])
-            g.props['index'] = float(self.group_map[gi])
-            nm = g.props.get('name')
-            if isinstance(nm, str) and nm:
-                g.props['name'] = self._fresh_name(
-                    nm, self.plan.name_suffix, used_group_names
-                )
-            ktr = G.ival(g.props.get('keyTriggerRefIndex'))
-            if ktr >= 0:
-                g.props['keyTriggerRefIndex'] = float(self._map_group(ktr))
-            for key in ('ite_atkName1', 'ite_atkName2'):
-                v = g.props.get(key)
-                if v:
-                    g.props[key] = self.attack_map.get(v, v)
-            ai_arr = g.props.get('actionIndex')
-            if ai_arr is not None and ai_arr is not UND:
-                for cat in G.arr_items(ai_arr):
-                    if isinstance(cat, (M.AmfEcmaArray, M.AmfStrictArray)):
-                        items = G.arr_items(cat)
-                        G.arr_set(cat, [float(action_map.get(G.ival(x), G.ival(x)))
-                                        if isinstance(x, (int, float)) else x for x in items])
-            d_groups.append(g)
-
-        G.arr_set(self.out_item.props['actionGroup'], d_groups)
-        G.arr_set(self.out_item.props['action'], d_actions)
-        G.arr_set(self.out_item.props['frame'], d_frames)
-        G.arr_set(self.out_item.props['spriteLimb'], d_slots)
-        target_counts = {
+        self.target_item_counts = {
             'groups': len(G.arr_items(self.dst.item.props.get('actionGroup'))),
             'actions': len(G.arr_items(self.dst.item.props.get('action'))),
             'frames': len(G.arr_items(self.dst.item.props.get('frame'))),
             'slots': len(G.arr_items(self.dst.item.props.get('spriteLimb'))),
         }
-        self.item_prefix_hashes = {
-            'groups': self._sequence_hash(d_groups[:target_counts['groups']]),
-            'actions': self._sequence_hash(d_actions[:target_counts['actions']]),
-            'frames': self._sequence_hash(d_frames[:target_counts['frames']]),
-            'slots': self._sequence_hash(d_slots[:target_counts['slots']]),
+
+        # 1:1 恒等映射 —— 保留给下游（_fix_frame_refs / _map_group）使用。
+        self.slot_map = {i: i for i in range(len(s_slots))}
+        self.group_map = {i: i for i, g in enumerate(s_groups)
+                          if isinstance(g, M.AmfObj)}
+        self.invalid_group_map = {}
+        self.item_action_map = {i: i for i in range(len(s_actions))}
+        self.item_frame_map = {i: i for i in range(len(s_frames))}
+
+        d_slots = G.arr_items(self.out_item.props['spriteLimb'])
+        for sl in d_slots:
+            if isinstance(sl, M.AmfObj):
+                self._map_spritelimb(sl)
+
+        d_frames = G.arr_items(self.out_item.props['frame'])
+        for fr in d_frames:
+            if isinstance(fr, M.AmfObj):
+                self._fix_frame_refs(fr, item_ctx=True)
+
+        d_actions = G.arr_items(self.out_item.props['action'])
+        # a_keyTgr.agi 是组号，恒等映射下无需改写，仍做一次范围校验。
+        for ai, act in enumerate(d_actions):
+            if not isinstance(act, M.AmfObj):
+                continue
+            for kt in G.arr_items(act.props.get('a_keyTgr')):
+                if isinstance(kt, M.AmfObj):
+                    agi = G.ival(kt.props.get('agi'), -1)
+                    if agi >= 0 and agi not in self.group_map:
+                        self.warnings.append(
+                            'item action %d 的 a_keyTgr.agi=%d 指向空组' % (ai, agi))
+
+        d_groups = G.arr_items(self.out_item.props['actionGroup'])
+        self.group_name_map = {}
+        self.unused_piece_warns = 0
+        for gi, g in enumerate(d_groups):
+            if not isinstance(g, M.AmfObj):
+                continue
+            nm = g.props.get('name')
+            if isinstance(nm, str) and nm:
+                # 组名保持源版本原样：独立包的名字进不了 iteHash
+                # （GenerateIteHash 只遍历 sptHash["item"]），顶不掉目标同名组。
+                self.group_name_map[gi] = (nm, nm)
+            for key in ('ite_atkName1', 'ite_atkName2'):
+                val = g.props.get(key)
+                if val:
+                    g.props[key] = self.attack_map.get(val, val)
+            # 闭包内的组是真的会被调用的，Piece.i 必须能唯一映射；闭包外的组
+            # （整包复制带过来但没人 route 到）映射不了就保留源值 —— 引擎在
+            # Spt.LoadFromBytes 里有 `piece.i < globalSpt.action.length` 的范围
+            # 检查，越界只 trace 一句。但绝不能写成负数：action[-1] 是 undefined，
+            # 再取 .frameIndex 会抛异常，而那里被 catch(Error) 吞掉、静默中止后续加载。
+            used = gi in self.group_copy
+            for piece in G.arr_items(g.props.get('piece')):
+                if not isinstance(piece, M.AmfObj):
+                    continue
+                try:
+                    self._map_piece_action(piece, gi, nm)
+                except RuntimeError:
+                    if used:
+                        raise
+                    self.unused_piece_warns += 1
+                    if self.unused_piece_warns <= 5:
+                        self.warnings.append(
+                            '未被调用的 item 组 %d(%s) 的 Piece.i=%s 无法映射，'
+                            '保留源值' % (gi, nm, G.ival(piece.props.get('i'), -1)))
+
+        self.target_item_hashes = {
+            'spt_payload_sha256': G.sha256(
+                self.dst.swf.binary_payload('Data.Global_itemSpt')
+            ),
+            'lmi_payload_sha256': G.sha256(
+                self.dst.swf.binary_payload('Data.Global_itemLmi')
+            ),
         }
-        self.target_item_counts = target_counts
-        self.stats['item_actions_copied'] = len(copy_actions)
-        self.stats['item_frames_copied'] = len(copy_frames)
-        self.stats['item_slots_added'] = len(d_slots) - len(G.arr_items(self.dst.item.props.get('spriteLimb')))
+        self.stats['item_copy_mode'] = 'verbatim-1to1'
+        self.stats['unused_piece_unmapped'] = self.unused_piece_warns
+        self.stats['item_groups_copied'] = len(self.group_map)
+        self.stats['item_groups_in_closure'] = len(self.group_copy)
+        self.stats['item_actions_copied'] = sum(
+            1 for a in d_actions if isinstance(a, M.AmfObj))
+        self.stats['item_frames_copied'] = sum(
+            1 for x in d_frames if isinstance(x, M.AmfObj))
+        self.stats['item_slots_copied'] = len(d_slots)
+        self.stats['routed_item_tables'] = {
+            'groups': len(d_groups), 'actions': len(d_actions),
+            'frames': len(d_frames), 'slots': len(d_slots),
+        }
+
+    def _map_piece_action(self, piece, group_index, group_name):
+        """把 Piece.i 从源 global spt 的动作下标重指到目标 global spt 的同名动作。
+
+        Spt.LoadFromBytes 对 ITEM 类型的 spt 会做
+        ``piece.fi = Global.sptHash["global"].action[piece.i].frameIndex``，
+        所以 Piece.i 必须是**目标** global spt 的合法下标。
+        """
+        src_i = G.ival(piece.props.get('i'), -1)
+        if src_i < 0:
+            return
+        dst_i = self._resolve_global_action(src_i, group_index, group_name)
+        piece.props['i'] = float(dst_i)
+        target_actions = G.arr_items(self.dst.spt('global').props.get('action'))
+        if 0 <= dst_i < len(target_actions) and isinstance(target_actions[dst_i], M.AmfObj):
+            piece.props['fi'] = target_actions[dst_i].props.get('frameIndex', -1.0)
+
+    def _resolve_global_action(self, src_i, group_index, group_name):
+        """按动作名唯一匹配。名字才是身份，帧内容不是。
+
+        早先这里额外要求源/目标动作的帧链内容签名一致，结果 rock 的
+        ROCK_PIECE_BIG、iceLand 的 ICE_PIECE1..3 全部匹配失败并让构建中止 —— 两边
+        动作同名同下标，只是帧美术不同。帧内容不一致只记警告。
+        """
+        if not hasattr(self, '_global_action_map'):
+            self._global_action_map = {}
+            self.global_action_notes = []
+        if src_i in self._global_action_map:
+            return self._global_action_map[src_i]
+        src_spt = self.src.spt('global')
+        dst_spt = self.dst.spt('global')
+        src_actions = G.arr_items(src_spt.props.get('action'))
+        dst_actions = G.arr_items(dst_spt.props.get('action'))
+        if not (0 <= src_i < len(src_actions)) or not isinstance(src_actions[src_i], M.AmfObj):
+            raise RuntimeError(
+                'item Piece.i=%d 越过源 global action 数组 (group=%s/%s)'
+                % (src_i, group_index, group_name)
+            )
+        source_name = src_actions[src_i].props.get('name')
+        if not isinstance(source_name, str) or not source_name:
+            raise RuntimeError(
+                'item Piece.i=%d 指向无名的源 global 动作 (group=%s/%s)'
+                % (src_i, group_index, group_name)
+            )
+        candidates = [
+            dst_i for dst_i, candidate in enumerate(dst_actions)
+            if isinstance(candidate, M.AmfObj)
+            and candidate.props.get('name') == source_name
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                'item Piece.i=%d 无法在目标 global spt 里唯一定位动作 %r '
+                '(group=%s/%s, candidates=%r)'
+                % (src_i, source_name, group_index, group_name, candidates)
+            )
+        dst_i = candidates[0]
+        same = (self._global_action_signature(src_spt, src_i)
+                == self._global_action_signature(dst_spt, dst_i))
+        note = {
+            'src_index': src_i, 'dst_index': dst_i, 'name': source_name,
+            'frames_identical': same,
+        }
+        self.global_action_notes.append(note)
+        if not same:
+            self.warnings.append(
+                'item Piece 动作 %r: 源 %d -> 目标 %d 同名但帧内容不同，'
+                '碎片美术会用目标版本' % (source_name, src_i, dst_i)
+            )
+        self._global_action_map[src_i] = dst_i
+        return dst_i
+
+    @staticmethod
+    def _global_action_signature(spt, action_index):
+        actions = G.arr_items(spt.props.get('action'))
+        frames = G.arr_items(spt.props.get('frame'))
+        action = actions[action_index]
+        stable_action = G.norm_obj_bytes(
+            action, drop=('index', 'frame', 'frameIndex')
+        )
+        chain = []
+        for fi in G.frames_of_action(frames, action):
+            frame = M.deep_clone(frames[fi])
+            for key in ('index', 'refIndex', 'refIndex_2', 'ref', 'ref_2',
+                        'limbPose', 'lmat'):
+                frame.props.pop(key, None)
+            chain.append(G.norm_obj_bytes(frame))
+        return G.md5(stable_action + b'|' + b'|'.join(chain))
 
     @staticmethod
     def _sequence_hash(items):
@@ -661,22 +796,61 @@ class Porter:
                     if rn:
                         box.props['refName'] = self.attack_map.get(rn, rn)
         for ctx, pt in G.frame_pts(fr):
+            resolution = G.resolve_pt(self.src, pt, ctx)
+            for warning in resolution.warnings:
+                self.warnings.append(self._format_pt_warning(warning))
+            final_group = resolution.final_int1
+
+            if ctx == 'cre' and final_group >= 0:
+                # 这里是三个 item bug 的共同修复点。移植过来的 cre 绝不能再让目标
+                # 的 Global.pt 插手：把源运行时算出的最终值内联进 cre，把 ref 置
+                # -1 让 CheckCopyRefPt 跳过模板分支，再把组号重映射到独立包的局部
+                # 下标，并打上路由标记指向独立 itemSpt。
+                #
+                # 旧行为保留了 ref>=0，于是目标模板整片覆盖 int1/vx/vy/vz/facing/
+                # int2/int3：saws 的 ref=142(int1=38) 被 Eyja 的 cre_sawsground
+                # 覆盖成 78、ref=143(int1=78) 被覆盖成 38（两个技能互换），
+                # lucas2/Azrael 的 ref=147/149(int1=80) 全被覆盖成 45
+                # (thunder_big_ball)。
+                for key in G.PT_COPY_KEYS:
+                    if key in resolution.final.props:
+                        pt.props[key] = M.deep_clone(resolution.final.props[key])
+                pt.props['ref'] = float(-1)
+                pt.props['refName'] = None
+                pt.props['int1'] = float(self._map_group(final_group))
+                pt.props['itemSptRoute'] = self.plan.namespace
+                self.routed_cre_count += 1
+                continue
+
             rn = pt.props.get('refName')
-            ref = G.ival(pt.props.get('ref'))
-            if rn:
+            raw_ref = G.ival(pt.props.get('ref'), -1)
+            mapped_template = False
+
+            # Prefer a named target Pt when the source template is provable.
+            template_name = (resolution.template.props.get('name')
+                              if isinstance(resolution.template, M.AmfObj)
+                              else None)
+            if template_name and template_name in self.pt_map:
+                mapped_name = self.pt_map[template_name]
+                target_index = getattr(self, 'out_pt_indices', {}).get(mapped_name)
+                if target_index is not None and raw_ref != -1:
+                    pt.props['refName'] = mapped_name
+                    pt.props['ref'] = float(target_index)
+                    mapped_template = True
+            elif rn:
+                # A refName with ref=-1 is intentionally direct and must stay
+                # direct; the runtime does not resolve the name in that case.
                 pt.props['refName'] = self.pt_map.get(rn, rn)
-            elif ref >= 0:
-                # 数字模板引用 -> 回填名字（按目标名），保持 ref>=0 让加载器重解析
-                if 0 <= ref < len(self.src.gdat.pts):
-                    nm = self.src.gdat.pts[ref].props.get('name')
-                    if nm:
-                        pt.props['refName'] = self.pt_map.get(nm, nm)
-                    else:
-                        self.warnings.append('帧 pt 数字引用指向无名模板 #%d' % ref)
-            if ctx == 'cre':
-                i1 = G.ival(pt.props.get('int1'), -1)
-                if i1 >= 0 and ref < 0:
-                    pt.props['int1'] = float(self._map_group(i1))
+
+            if raw_ref >= 0 and not mapped_template:
+                # A numeric source ref without a unique target template is
+                # de-templated. Inline the source runtime result so a target
+                # Pt at the same numeric index can never hijack this cre.
+                for key in G.PT_COPY_KEYS:
+                    if key in resolution.final.props:
+                        pt.props[key] = M.deep_clone(resolution.final.props[key])
+                pt.props['ref'] = float(-1)
+
         sfx = G.ival(fr.props.get('sfx'))
         if sfx >= 0 and sfx in self.sfx_map and self.sfx_map[sfx] != sfx:
             fr.props['sfx'] = float(self.sfx_map[sfx])
@@ -685,15 +859,32 @@ class Porter:
                 for z in G.arr_items(fr.props.get(key)):
                     if isinstance(z, M.AmfObj):
                         i = G.ival(z.props.get('i'))
-                        if i in self.slot_map and self.slot_map[i] != i:
-                            z.props['i'] = float(self.slot_map[i])
+                        if i < 0:
+                            continue
+                        if i not in self.slot_map:
+                            raise RuntimeError('item 帧引用未闭包 spriteLimb 槽位 %d' % i)
+                        z.props['i'] = float(self.slot_map[i])
             for key in ('upLimbs', 'lowLimbs'):
                 arr = fr.props.get(key)
                 if arr is not None and arr is not UND:
                     items = G.arr_items(arr)
                     if items:
-                        G.arr_set(arr, [float(self.slot_map.get(G.ival(x), G.ival(x)))
-                                        if isinstance(x, (int, float)) else x for x in items])
+                        mapped = []
+                        for value in items:
+                            if not isinstance(value, (int, float)):
+                                mapped.append(value)
+                                continue
+                            src_slot = G.ival(value)
+                            if src_slot < 0:
+                                mapped.append(value)
+                                continue
+                            if src_slot not in self.slot_map:
+                                raise RuntimeError(
+                                    'item 帧 %s 引用未闭包 spriteLimb 槽位 %d' %
+                                    (key, src_slot)
+                                )
+                            mapped.append(float(self.slot_map[src_slot]))
+                        G.arr_set(arr, mapped)
 
     # ---- 角色 SPT ----
 
@@ -727,13 +918,15 @@ class Porter:
     def _prepare_lmi_layout(self):
         """按真实源 LMI 文件分桶，并按角色第一次引用顺序保留加载顺序。"""
         source_buckets = {}
-        self.item_bucket = []
+        self.item_bucket = sorted(
+            nm for nm in self.item_limb_names if nm in self.limb_copy
+        )
+        item_set = set(self.item_bucket)
         for nm in sorted(self.limb_copy):
+            if nm in item_set:
+                continue
             source_path, _, _ = self.src.limbs[nm]
-            if source_path == 'lmi_data/item.lmi':
-                self.item_bucket.append(nm)
-            else:
-                source_buckets.setdefault(source_path, []).append(nm)
+            source_buckets.setdefault(source_path, []).append(nm)
 
         source_order = []
         seen = set()
@@ -751,6 +944,12 @@ class Porter:
         self.lmi_path_map = {}
         self.lmi_buckets = {}
         self.out_lmi_order = []
+        self.item_lmi_path = self.item_lmi_path_planned
+        if self.item_bucket:
+            if self.item_lmi_path in used_paths:
+                raise RuntimeError('独立 item LMI 路径已存在: %s' % self.item_lmi_path)
+            used_paths.add(self.item_lmi_path)
+            self.lmi_path_map['lmi_data/item.lmi'] = self.item_lmi_path
         for source_path in source_order:
             stem = source_path[len('lmi_data/'):-4]
             safe_stem = re.sub(r'[^A-Za-z0-9_]+', '_', stem).strip('_') or 'data'
@@ -768,22 +967,19 @@ class Porter:
     # ---- LMI 构建 ----
 
     def _build_lmis(self):
-        """按 _prepare_lmi_layout 的源文件分桶构建 LMI；item 合并进目标 itemLmi。"""
+        """按源文件分桶构建角色 LMI，并独立构造 item LMI。"""
+        self.lmi_warnings = []
+        self.png_winner_resolutions = []
         self.out_lmis = {}
         for path in self.out_lmi_order:
             names = self.lmi_buckets[path]
             self.out_lmis[path] = self._make_lmi_file(names)
 
-        # itemLmi 合并
         self.out_itemlmi = None
         if self.item_bucket:
-            base = self.dst.lmis['lmi_data/item.lmi']
-            merged = G.LmiFile(
-                [M.deep_clone(p) for p in base.limb_pics],
-                list(base.pngs),
-                [M.deep_clone(l) for l in base.limbs])
-            self._append_limbs(merged, self.item_bucket)
-            self.out_itemlmi = merged
+            self.out_itemlmi = self._make_lmi_file(self.item_bucket)
+        self._validate_output_lmis()
+        self.warnings.extend(self.lmi_warnings)
         self.stats['out_lmi_files'] = {p: (len(f.limbs), len(f.limb_pics))
                                        for p, f in self.out_lmis.items()}
         if self.out_itemlmi:
@@ -807,7 +1003,19 @@ class Porter:
             pic = sf.limb_pics[idx]
             for refkey in ('refIndex', 'bmRefIndex'):
                 r = G.ival(pic.props.get(refkey))
-                if 0 <= r < len(sf.limb_pics) and r != idx:
+                if r == idx:
+                    self.lmi_warnings.append(
+                        'LMI 图片 %s[%d] 的 %s 自引用，按运行时置空' %
+                        (path, idx, refkey)
+                    )
+                    continue
+                if r >= 0:
+                    if r >= len(sf.limb_pics):
+                        self.lmi_warnings.append(
+                            'LMI 图片 %s[%d] 的 %s=%d 越界，按运行时置空' %
+                            (path, idx, refkey, r)
+                        )
+                        continue
                     collect_pic(path, sf, r)
 
         for nm in names:
@@ -825,19 +1033,56 @@ class Porter:
         for path, idx in ordered:
             sf = needed[(path, idx)]
             pic = M.deep_clone(sf.limb_pics[idx])
+            raw_refs = {
+                key: G.ival(pic.props.get(key), -1)
+                for key in ('refIndex', 'bmRefIndex')
+            }
             pos = pic_pos[(path, idx)]
             pic.props['index'] = float(pos)
             fn = pic.props.get('filename')
             if isinstance(fn, str) and fn:
                 pic.props['filename'] = self.png_map.get(fn, fn)
             for refkey in ('refIndex', 'bmRefIndex'):
-                r = G.ival(pic.props.get(refkey))
+                r = raw_refs[refkey]
+                if r == idx:
+                    pic.props[refkey] = float(-1)
+                    continue
                 if (path, r) in pic_pos:
                     pic.props[refkey] = float(pic_pos[(path, r)])
                 elif r >= 0:
-                    pic.props[refkey] = float(-1)
+                    if r >= len(sf.limb_pics):
+                        pic.props[refkey] = float(-1)
+                    else:
+                        raise RuntimeError(
+                            'LMI 图片 %s[%d] 的 %s=%d 未进入闭包' %
+                            (path, idx, refkey, r)
+                        )
+            embedded = bool(pic.props.get('embeded'))
+            png = None
+            if embedded:
+                winner = src.pngs.get(fn) if isinstance(fn, str) else None
+                if winner is None or winner[1] is None:
+                    raise RuntimeError(
+                        'LMI 图片 %s[%d] embeded=true 但源运行时没有 PNG winner' %
+                        (path, idx)
+                    )
+                png = winner[1]
+                winner_pic = winner[2]
+                for key in ('cx', 'cy', 'r0'):
+                    if key in winner_pic.props:
+                        pic.props[key] = M.deep_clone(winner_pic.props[key])
+                own = sf.pngs[idx]
+                if own is None or own != png:
+                    self.png_winner_resolutions.append({
+                        'filename': fn,
+                        'source_path': path,
+                        'source_index': idx,
+                        'winner_path': winner[0],
+                        'winner_index': winner[3],
+                        'winner_sha256': G.sha256(png),
+                    })
             out.limb_pics.append(pic)
-            out.pngs.append(sf.pngs[idx])
+            out.pngs.append(png)
 
         for nm in names:
             sp, limb, sf = src.limbs[nm]
@@ -861,6 +1106,66 @@ class Porter:
                     G.arr_set(lp, [None] * len(G.arr_items(lp)))
             out.limbs.append(c)
 
+    def _validate_output_lmis(self):
+        files = []
+        if self.out_itemlmi is not None:
+            files.append((self.item_lmi_path, self.out_itemlmi))
+        files.extend((path, self.out_lmis[path]) for path in self.out_lmi_order)
+
+        limb_owner = {name: path for name, (path, _, _) in self.dst.limbs.items()}
+        filename_hash = {
+            name: G.sha256(entry[1]) for name, entry in self.dst.pngs.items()
+            if entry[1] is not None
+        }
+        for path, lmi in files:
+            if len(lmi.limb_pics) != len(lmi.pngs):
+                raise RuntimeError('%s 的 limbPic/PNG 数量不一致' % path)
+            for index, (pic, png) in enumerate(zip(lmi.limb_pics, lmi.pngs)):
+                if G.ival(pic.props.get('index'), -1) != index:
+                    raise RuntimeError('%s limbPic[%d].index 不连续' % (path, index))
+                embedded = bool(pic.props.get('embeded'))
+                if embedded != (png is not None):
+                    raise RuntimeError(
+                        '%s limbPic[%d] embeded 与 PNG 存在性不一致' %
+                        (path, index)
+                    )
+                for key in ('refIndex', 'bmRefIndex'):
+                    ref = G.ival(pic.props.get(key), -1)
+                    if ref >= len(lmi.limb_pics) or ref == index:
+                        raise RuntimeError(
+                            '%s limbPic[%d].%s=%d 非法' %
+                            (path, index, key, ref)
+                        )
+                filename = pic.props.get('filename')
+                if embedded and not filename:
+                    raise RuntimeError('%s limbPic[%d] 缺少 filename' % (path, index))
+                if embedded:
+                    digest = G.sha256(png)
+                    old = filename_hash.get(filename)
+                    if old is not None and old != digest:
+                        raise RuntimeError(
+                            '全局 PNG filename winner 冲突 %r: %s != %s' %
+                            (filename, old, digest)
+                        )
+                    filename_hash[filename] = digest
+            for limb in lmi.limbs:
+                name = limb.props.get('name')
+                if not name:
+                    raise RuntimeError('%s 含无名 limb' % path)
+                if name in limb_owner:
+                    raise RuntimeError(
+                        'limb 名称跨 LMI 冲突 %r: %s / %s' %
+                        (name, limb_owner[name], path)
+                    )
+                limb_owner[name] = path
+                for value in G.arr_items(limb.props.get('limbPicIndex')):
+                    index = G.ival(value, -1)
+                    if index >= len(lmi.limb_pics):
+                        raise RuntimeError(
+                            '%s limb %r 的 limbPicIndex=%d 越界' %
+                            (path, name, index)
+                        )
+
     # ================================================== 载荷输出
 
     def payloads(self):
@@ -869,16 +1174,45 @@ class Porter:
         rep_p = {}
         gd = G.GdatFile(self.out_attacks, self.out_pts)
         rep_p['Data.Global_globalDat'] = M.wrap_payload(gd.build())
-        rep_p['Data.Global_itemSpt'] = M.wrap_payload(G.SptFile(self.out_item).build())
-        if self.out_itemlmi is not None:
-            rep_p['Data.Global_itemLmi'] = M.wrap_payload(self.out_itemlmi.build())
 
         load_seq = []
         lmi_classes = {}
+        item_resource = None
+        if self.out_itemlmi is not None:
+            item_lmi_cls = 'Data.Global_%s_itemLmi' % self.plan.namespace
+            item_spt_cls = 'Data.Global_%s_itemSpt' % self.plan.namespace
+            new_p[item_lmi_cls] = M.wrap_payload(self.out_itemlmi.build())
+            new_p[item_spt_cls] = M.wrap_payload(G.SptFile(self.out_item).build())
+            lmi_classes[self.item_lmi_path] = item_lmi_cls
+            # LMI 必须早于所有原生 SPT，不能只早于自己那个独立 SPT：解析 SPT 时
+            # 就把 spriteLimb.limbName 定死成 Global.limb[name]（Spt.as:1133），
+            # 之后再注册的 limb 对它永远不可见，且不报任何错。
+            load_seq.append(('lmi', item_lmi_cls, self.item_lmi_path))
+            load_seq.append(('spt', item_spt_cls, self.item_spt_path_planned))
+            item_resource = {
+                'namespace': self.plan.namespace,
+                'lmi_class': item_lmi_cls,
+                'lmi_path': self.item_lmi_path,
+                'spt_class': item_spt_cls,
+                'spt_path': self.item_spt_path_planned,
+                'spt_id': self.out_item.props.get('id'),
+                'spt_hash_key': self.out_item.props.get('id'),
+                'groups': len(G.arr_items(self.out_item.props['actionGroup'])),
+                'limbs': len(self.out_itemlmi.limbs),
+                'pics': len(self.out_itemlmi.limb_pics),
+                'routed_cre': self.routed_cre_count,
+            }
+        elif self.group_copy:
+            raise RuntimeError(
+                '有 %d 个 item 组要移植，但没有生成独立 item LMI —— '
+                '独立 itemSpt 会引用不到任何 limb' % len(self.group_copy))
+
         for path in self.out_lmi_order:
             f = self.out_lmis[path]
             stem = path[len('lmi_data/'):-4]
             cls = 'Data.Global_%sLmi' % stem
+            if cls in new_p:
+                raise RuntimeError('新增资源类冲突: %s' % cls)
             new_p[cls] = M.wrap_payload(f.build())
             lmi_classes[path] = cls
             load_seq.append(('lmi', cls, path))
@@ -906,6 +1240,10 @@ class Porter:
             new_p[cls] = M.wrap_payload(G.SptFile(self.out_spts[cid]).build())
             load_seq.append(('spt', cls, 'spt_data/%s.spt' % self.plan.new_id(cid)))
 
+        # 清单与运行时相同：A 的全部 LMI 在前，B 的 SPT 保持 refSpt 拓扑序。
+        lmi_loads, spt_loads = L.split_load_sequence(load_seq)
+        load_seq = lmi_loads + spt_loads
+
         mapped_png_names = set(self.png_map.values())
         copied_png_hashes = {}
         png_files = []
@@ -916,9 +1254,31 @@ class Porter:
             for idx, pic in enumerate(lmi.limb_pics):
                 filename = pic.props.get('filename')
                 if filename in mapped_png_names and lmi.pngs[idx] is not None:
-                    copied_png_hashes[filename] = G.md5(lmi.pngs[idx])
+                    digest = G.sha256(lmi.pngs[idx])
+                    old = copied_png_hashes.get(filename)
+                    if old is not None and old != digest:
+                        raise RuntimeError('输出 PNG filename 内容冲突: %s' % filename)
+                    copied_png_hashes[filename] = digest
+
+        target_item_hashes = {
+            'spt_class': 'Data.Global_itemSpt',
+            'spt_payload_sha256': G.sha256(
+                self.dst.swf.binary_payload('Data.Global_itemSpt')
+            ),
+            'lmi_class': 'Data.Global_itemLmi',
+            'lmi_payload_sha256': G.sha256(
+                self.dst.swf.binary_payload('Data.Global_itemLmi')
+            ),
+        }
+        payload_hashes = {
+            cls: G.sha256(payload) for cls, payload in sorted(new_p.items())
+        }
+        payload_hashes.update(
+            (cls, G.sha256(payload)) for cls, payload in sorted(rep_p.items())
+        )
 
         manifest = {
+            'namespace': self.plan.namespace,
             'chars': [cid for cid in self.plan.chars],
             'new_ids': {cid: self.plan.new_id(cid) for cid in self.port_ids},
             'port_ids': list(self.port_ids),
@@ -926,17 +1286,32 @@ class Porter:
                 cid: self.src.spt(cid).props.get('refSpt') for cid in self.port_ids
             },
             'load_sequence': load_seq,
+            'item_lmi_resource': item_resource,
             'new_sounds': self.new_sounds,
             'sfx_map': self.sfx_map,
             'item_group_map': dict(self.group_map),
+            'item_group_name_map': dict(getattr(self, 'group_name_map', {})),
             'invalid_group_map': dict(self.invalid_group_map),
+            'item_action_map': dict(self.item_action_map),
+            'item_frame_map': dict(self.item_frame_map),
+            'item_slot_map': dict(self.slot_map),
+            'global_action_map': dict(getattr(self, '_global_action_map', {})),
+            'global_action_notes': list(getattr(self, 'global_action_notes', [])),
             'item_limb_map': {
                 nm: self.limb_map.get(nm, nm) for nm in sorted(self.item_limb_names)
             },
             'copied_png_hashes': copied_png_hashes,
             'target_item_counts': self.target_item_counts,
-            'item_prefix_hashes': self.item_prefix_hashes,
+            'target_item_hashes': target_item_hashes,
+            'routed_cre_count': self.routed_cre_count,
+            'dangling_item_groups': sorted(self.dangling_groups),
+            'payload_hashes': payload_hashes,
+            'source_lmi_load_order': list(self.src.lmi_load_order),
+            'png_winner_resolutions': list(self.png_winner_resolutions),
+            'cre_resolutions': self.cre_resolutions,
+            'item_cre_resolutions': self.item_cre_resolutions,
             'stats': self.stats,
             'warnings': self.warnings,
+            'warning_digest': self.warning_digest(),
         }
         return new_p, rep_p, manifest

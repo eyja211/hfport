@@ -47,8 +47,9 @@ def main():
                 ok = False
     bg = open(os.path.join(outdir, 'scripts', 'Data', 'BgInfoFile.as'), encoding='utf-8').read()
     for kind, cls, path in report['manifest']['load_sequence']:
-        if path not in bg:
-            print('  X BgInfoFile.as 缺少加载', path)
+        host = text if kind == 'lmi' else bg
+        if path not in host:
+            print('  X %s 缺少加载' % ('Global.as' if kind == 'lmi' else 'BgInfoFile.as'), path)
             ok = False
     sel = open(os.path.join(outdir, 'scripts', 'Web_misc', 'SelectCharPanel.as'), encoding='utf-8').read()
     for meta in b.char_meta:

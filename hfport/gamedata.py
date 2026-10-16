@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """HF 游戏数据模型 + 移植引擎：闭包 -> 改名/重映射 -> 合并 -> 新载荷。
 
-原则：只改"移植副本"，目标版本已有数据除三个合并文件(itemSpt/itemLmi/globalDat
-的**追加**)外一律不动。
+原则：只改"移植副本"。目标默认 itemSpt/itemLmi 保持原字节，迁移 item
+进入独立的 routed SPT/LMI；只有 globalDat 会按依赖闭包追加。
 """
 import hashlib
 from . import amf as M
@@ -45,8 +45,112 @@ def ival(v, dflt=-1):
     return int(v) if isinstance(v, (int, float)) else dflt
 
 
+PT_COPY_KEYS = ('facing', 'vx', 'vy', 'vz', 'int1', 'int2', 'int3')
+
+
+class PtResolution:
+    """One Pt resolved with the runtime CheckCopyRefPt semantics."""
+
+    def __init__(self, original, final, template=None, template_index=-1,
+                 route=None, status='direct', warnings=None):
+        self.original = original
+        self.final = final
+        self.template = template
+        self.template_index = template_index
+        self.route = route
+        self.status = status
+        self.warnings = list(warnings or ())
+
+    @property
+    def final_int1(self):
+        return ival(self.final.props.get('int1'), -1)
+
+    @property
+    def effective_ref(self):
+        return ival(self.final.props.get('ref'), -1)
+
+    def report(self):
+        keys = ('refName', 'ref', 'facing', 'vx', 'vy', 'vz',
+                'int1', 'int2', 'int3', 'itemSptRoute')
+        return {
+            'original': {k: self.original.props.get(k) for k in keys},
+            'template_index': self.template_index,
+            'template_name': (self.template.props.get('name')
+                              if isinstance(self.template, M.AmfObj) else None),
+            'final': {k: self.final.props.get(k) for k in keys},
+            'route': self.route,
+            'status': self.status,
+            'warnings': list(self.warnings),
+        }
+
+
+def resolve_pt(mod, pt, context=''):
+    """Resolve one Pt exactly as Data.Spt.CheckCopyRefPt does."""
+    if not isinstance(pt, M.AmfObj):
+        raise TypeError('Pt must be AmfObj, got %r' % (type(pt),))
+    original = M.deep_clone(pt)
+    final = M.deep_clone(pt)
+    route = pt.props.get('itemSptRoute')
+    raw_ref = ival(pt.props.get('ref'), -1)
+    effective_ref = raw_ref
+    status = 'direct'
+    warnings = []
+
+    # This is the runtime refName/ref branch.
+    if pt.props.get('refName') is not None and raw_ref != -1:
+        name = pt.props.get('refName')
+        ent = mod.pt_by_name.get(name) if isinstance(name, str) else None
+        if ent is None:
+            warnings.append({
+                'kind': 'pt-ref-name-missing',
+                'context': context,
+                'refName': name,
+                'ref': raw_ref,
+            })
+            status = 'unresolved-refName'
+        else:
+            effective_ref = ent[0]
+            status = 'refName-resolved'
+
+    pts = mod.gdat.pts
+    if 0 <= effective_ref < len(pts):
+        template = pts[effective_ref]
+        for key in PT_COPY_KEYS:
+            if key in template.props:
+                final.props[key] = M.deep_clone(template.props[key])
+        return PtResolution(
+            original, final, template=template, template_index=effective_ref,
+            route=route, status='template' if status == 'direct' else status,
+            warnings=warnings,
+        )
+
+    if effective_ref >= 0:
+        warnings.append({
+            'kind': 'pt-ref-out-of-range',
+            'context': context,
+            'refName': pt.props.get('refName'),
+            'ref': effective_ref,
+            'pt_count': len(pts),
+        })
+        status = 'invalid-ref'
+    return PtResolution(
+        original, final, template=None, template_index=-1, route=route,
+        status=status, warnings=warnings,
+    )
+
+
+def resolve_pt_fields(mod, pt, context=''):
+    """Return the final CopyRefAttributes fields and the full resolution."""
+    res = resolve_pt(mod, pt, context)
+    return {k: res.final.props.get(k) for k in PT_COPY_KEYS}, res
+
+
 def md5(b):
     return hashlib.md5(b).hexdigest()
+
+
+def sha256(b):
+    return hashlib.sha256(b).hexdigest()
 
 
 def norm_obj_bytes(obj, drop=()):
@@ -162,6 +266,7 @@ class ModView:
         self.lmis = {}       # 'lmi_data/x.lmi' -> LmiFile
         self.limbs = {}      # limb name -> (lmi_path, limb_obj, LmiFile)
         self.pngs = {}       # pic filename -> (lmi_path, png_bytes, pic_obj)
+        self.lmi_load_order = []
         self.spts = {}
         self.gdat = GdatFile.parse(M.unwrap_payload(self.swf.binary_payload('Data.Global_globalDat')))
         self.attack_by_name = {}
@@ -180,26 +285,81 @@ class ModView:
         return 'lmi_data/%s.lmi' % cls[len('Data.Global_'):-3]
 
     def load_all_lmis(self):
+        parsed = {}
         for cls in sorted(self.swf.class_to_char_id()):
             if cls.startswith('Data.Global_') and cls.endswith('Lmi'):
                 path = self.lmi_path_of_class(cls)
-                if path in self.lmis:
+                if path in parsed:
                     continue
                 f = LmiFile.parse(M.unwrap_payload(self.swf.binary_payload(cls)))
-                self.lmis[path] = f
-                for i, pic in enumerate(f.limb_pics):
-                    fn = pic.props.get('filename')
-                    if fn and f.pngs[i] is not None:
-                        self.pngs[fn] = (path, f.pngs[i], pic)
-                for limb in f.limbs:
-                    nm = limb.props.get('name')
-                    if nm:
-                        self.limbs[nm] = (path, limb, f)
+                parsed[path] = f
+
+        declared = self._declared_lmi_load_order()
+        order = [path for path in declared if path in parsed]
+        order.extend(sorted(set(parsed) - set(order)))
+        self.lmi_load_order = order
+        self.lmis = {path: parsed[path] for path in order}
+        self.limbs = {}
+        self.pngs = {}
+        for path in order:
+            f = parsed[path]
+            for i, pic in enumerate(f.limb_pics):
+                fn = pic.props.get('filename')
+                if fn and f.pngs[i] is not None and pic.props.get('embeded'):
+                    self.pngs[fn] = (path, f.pngs[i], pic, i)
+            for limb in f.limbs:
+                nm = limb.props.get('name')
+                if nm:
+                    self.limbs[nm] = (path, limb, f)
+
+    def _declared_lmi_load_order(self):
+        """Read the runtime LMI path order from the main ABC load methods."""
+        from . import abcpatch as A
+
+        out = []
+        seen = set()
+        method_specs = (
+            ('Data', 'Global', 'LoadGlobalDatFromCompressedBytes', True),
+            ('Data', 'Global', 'LoadAllData', True),
+            ('Data', 'BgInfoFile', 'LoadFromCompressedBytes', True),
+        )
+        for _, tag in self.swf.find_tags(S.TAG_DOABC):
+            try:
+                _, _, abc_bytes = S.parse_doabc(tag.body)
+                abc = A.AbcFile.parse(abc_bytes)
+            except Exception:
+                continue
+            for package, cls_name, method_name, static in method_specs:
+                method, _ = abc.find_class_method(
+                    package, cls_name, method_name, static=static
+                )
+                body = abc.body_of_method(method) if method is not None else None
+                if body is None:
+                    continue
+                for _, op, operands, _ in A.walk_code(body.code):
+                    if op != 0x2C or not operands:
+                        continue
+                    value = abc.strings[operands[0]]
+                    if (isinstance(value, str)
+                            and value.startswith('lmi_data/')
+                            and value.endswith('.lmi')
+                            and value not in seen):
+                        seen.add(value)
+                        out.append(value)
+        return out
 
     def spt(self, cid):
         if cid not in self.spts:
             self.spts[cid] = SptFile.parse(M.unwrap_payload(self.swf.binary_payload(SPT_OF(cid)))).obj
         return self.spts[cid]
+
+    def spts_available(self):
+        """这个版本里存在哪些 SPT id（按 Data.Global_<id>Spt 资源类推断）。"""
+        out = set()
+        for cls in self.swf.class_to_char_id():
+            if cls.startswith('Data.Global_') and cls.endswith('Spt'):
+                out.add(cls[len('Data.Global_'):-3])
+        return out
 
     # ---- 内容签名（判定"同名同内容"可复用）----
 
@@ -278,6 +438,8 @@ class ItemClosure:
         self.pt_indexes = set()
         self.sfx = set()
         self.limb_slots = set()    # itemSpt.spriteLimb 下标
+        self.pt_resolutions = []
+        self.resolution_warnings = []
 
     def expand(self, seeds):
         item = self.mod.item
@@ -312,6 +474,13 @@ class ItemClosure:
                     if ai in self.actions:
                         continue
                     self.actions.add(ai)
+                    akt = actions[ai].props.get('a_keyTgr')
+                    for trigger in arr_items(akt):
+                        if not isinstance(trigger, M.AmfObj):
+                            continue
+                        agi = ival(trigger.props.get('agi'), -1)
+                        if agi >= 0:
+                            todo.add(agi)
                     for fi in frames_of_action(frames, actions[ai]):
                         self._visit_frame(frames, fi, todo)
         return self
@@ -328,17 +497,23 @@ class ItemClosure:
                 if isinstance(box, M.AmfObj) and box.props.get('refName'):
                     self.attacks.add(box.props['refName'])
         for ctx, pt in frame_pts(fr):
+            resolution = resolve_pt(self.mod, pt, ctx)
+            self.pt_resolutions.append(resolution)
+            self.resolution_warnings.extend(resolution.warnings)
             rn = pt.props.get('refName')
             ref = ival(pt.props.get('ref'))
             if rn:
                 self.pt_names.add(rn)
                 if ctx == 'cre':
                     self.pt_cre_names.add(rn)
-            elif ref >= 0:
+            if ref >= 0:
                 self.pt_indexes.add((ref, ctx))
             if ctx == 'cre':
-                i1 = ival(pt.props.get('int1'), -1)
-                if i1 >= 0 and ref < 0:
+                # Item groups are selected from the post-template Pt, not the
+                # raw cre.int1. This is what keeps sinan/lucas/leo/saws aligned
+                # with the game's CheckCopyRefPt path.
+                i1 = resolution.final_int1
+                if i1 >= 0:
                     todo_groups.add(i1)
         sfx = ival(fr.props.get('sfx'))
         if sfx >= 0:
@@ -376,11 +551,12 @@ def spt_limb_names(spt_obj):
     return out
 
 
-def spt_refs(spt_obj):
+def spt_refs(spt_obj, mod=None):
     """角色 SPT 的直接外部引用。"""
     refs = {'attacks': set(), 'pt_names': set(), 'pt_cre_names': set(),
-            'pt_indexes': set(), 'int1': set(), 'sfx': set()}
-    for fr in arr_items(spt_obj.props.get('frame')):
+            'pt_indexes': set(), 'int1': set(), 'sfx': set(),
+            'pt_resolutions': [], 'resolution_warnings': []}
+    for fi, fr in enumerate(arr_items(spt_obj.props.get('frame'))):
         if not isinstance(fr, M.AmfObj):
             continue
         for key in ('attack', 'attackB', 'editAttack', 'editAttackB'):
@@ -388,17 +564,21 @@ def spt_refs(spt_obj):
                 if isinstance(box, M.AmfObj) and box.props.get('refName'):
                     refs['attacks'].add(box.props['refName'])
         for ctx, pt in frame_pts(fr):
+            resolution = resolve_pt(mod, pt, '%s:%d' % (ctx, fi)) if mod else None
+            if resolution is not None:
+                refs['pt_resolutions'].append(resolution)
+                refs['resolution_warnings'].extend(resolution.warnings)
             rn = pt.props.get('refName')
             ref = ival(pt.props.get('ref'))
             if rn:
                 refs['pt_names'].add(rn)
                 if ctx == 'cre':
                     refs['pt_cre_names'].add(rn)
-            elif ref >= 0:
+            if ref >= 0:
                 refs['pt_indexes'].add((ref, ctx))
             if ctx == 'cre':
-                i1 = ival(pt.props.get('int1'), -1)
-                if i1 >= 0 and ref < 0:
+                i1 = resolution.final_int1 if resolution else ival(pt.props.get('int1'), -1)
+                if i1 >= 0:
                     refs['int1'].add(i1)
         sfx = ival(fr.props.get('sfx'))
         if sfx >= 0:
